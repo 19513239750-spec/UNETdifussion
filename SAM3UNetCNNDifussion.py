@@ -375,27 +375,52 @@ class AdaGN_ResidualBlock(nn.Module):
         return x + res
 
 class MaskDiffusionHead(nn.Module):
-    def __init__(self, feature_dim=128, hidden_dim=128, num_classes=7): # 增加参数
+    def __init__(self, feature_dim=128, hidden_dim=128, num_classes=7):
         super().__init__()
+        # Conditioning: t(1) + visual features(feature_dim) + coarse logits(num_classes) + boundary logit(1)
+        cond_dim = 1 + feature_dim + num_classes + 1
         self.cond_mlp = nn.Sequential(
-            nn.Linear(1 + feature_dim, hidden_dim),
+            nn.Linear(cond_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        # 输入改为 num_classes 通道 (7)
         self.mask_in = nn.Conv2d(num_classes, hidden_dim, kernel_size=3, padding=1)
         self.res_block = AdaGN_ResidualBlock(hidden_dim, hidden_dim)
-        # 输出改为 num_classes 通道 (7)
         self.out_conv = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
-    def forward(self, x_t, t, cond_feat):
+    def forward(self, x_t, t, cond_feat, coarse_logits, boundary_logits):
+        """
+        x_t:            [B, num_classes, H, W]  noisy mask at current step
+        t:              [B]                      diffusion timestep
+        cond_feat:      [B, feature_dim, H, W]  visual features from UNet decoder
+        coarse_logits:  [B, num_classes, H, W]  coarse segmentation prior
+        boundary_logits:[B, 1, H, W]             boundary prior
+        """
         global_feat = F.adaptive_avg_pool2d(cond_feat, 1).flatten(1)
-        t_input = torch.cat([t.view(-1, 1).to(x_t.dtype), global_feat], dim=1)
+        coarse_global = F.adaptive_avg_pool2d(coarse_logits, 1).flatten(1)
+        boundary_global = F.adaptive_avg_pool2d(boundary_logits, 1).flatten(1)
+        t_input = torch.cat(
+            [t.view(-1, 1).to(x_t.dtype), global_feat, coarse_global, boundary_global], dim=1
+        )
         c_emb = self.cond_mlp(t_input)
-        
         x = self.mask_in(x_t)
         x = self.res_block(x, c_emb)
         return self.out_conv(x)
+
+
+class BoundaryHead(nn.Module):
+    """Lightweight head to predict a binary boundary map from visual features."""
+    def __init__(self, in_channels=128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, 1, kernel_size=1)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
 
 class EBAModule(nn.Module):
     """
@@ -645,12 +670,14 @@ def _create_vit_backbone(img_size):
     )
 
 
-class SAM3UNetCNNDifussion(nn.Module):
+class SAM3UNetCNNDifussionv2(nn.Module):
     def __init__(self, checkpoint_path=None, img_size=336, num_classes=7) -> None:
-        super(SAM3UNetCNNDifussion, self).__init__()
+        super(SAM3UNetCNNDifussionv2, self).__init__()
+        self.num_classes = num_classes
         self.sam3_vit = _create_vit_backbone(img_size)
         self.cnn_branch = CNNFeatureBranch(in_chans=3, embed_dim=128)
         self.diffusion_head = MaskDiffusionHead(feature_dim=128, num_classes=num_classes)
+        self.boundary_head = BoundaryHead(in_channels=128)
 
 
         if checkpoint_path:
@@ -695,27 +722,21 @@ class SAM3UNetCNNDifussion(nn.Module):
         self.eba_2 = EBAModule(channels=128)
         self.eba_3 = EBAModule(channels=128)
         self.eba_4 = EBAModule(channels=128)
-    def forward(self, x, mask_t=None, t=None):
-        B, C, H, W = x.shape
-        
-        # 1. 提取骨干特征
+    def _extract_features(self, x):
+        """Extract visual features, coarse logits, and boundary logits at feature-map resolution."""
         vit_feat = self.sam3_vit(x)[-1]
         cnn_x1, cnn_x2, cnn_x3, cnn_x4 = self.cnn_branch(x)
 
-        # 2. 修正：动态对齐 ViT 特征到 CNN 特征的尺寸
-        # 以前是 size=(H//4, W//4)，现在直接用 cnn_x1.shape[2:]
         vit_x1 = F.interpolate(self.reduce1(vit_feat), size=cnn_x1.shape[2:], mode='bilinear', align_corners=False)
         vit_x2 = F.interpolate(self.reduce2(vit_feat), size=cnn_x2.shape[2:], mode='bilinear', align_corners=False)
         vit_x3 = F.interpolate(self.reduce3(vit_feat), size=cnn_x3.shape[2:], mode='bilinear', align_corners=False)
         vit_x4 = F.interpolate(self.reduce4(vit_feat), size=cnn_x4.shape[2:], mode='bilinear', align_corners=False)
 
-        # 3. 此时尺寸已对齐，EBAModule 不会报错
-        fused_x1 = self.eba_1(vit_x1, cnn_x1)  
-        fused_x2 = self.eba_2(vit_x2, cnn_x2)  
-        fused_x3 = self.eba_3(vit_x3, cnn_x3)  
-        fused_x4 = self.eba_4(vit_x4, cnn_x4)  
+        fused_x1 = self.eba_1(vit_x1, cnn_x1)
+        fused_x2 = self.eba_2(vit_x2, cnn_x2)
+        fused_x3 = self.eba_3(vit_x3, cnn_x3)
+        fused_x4 = self.eba_4(vit_x4, cnn_x4)
 
-        # 4. 解码路径
         x_dec = self.gltb4(fused_x4)
         x_dec = self.wf1(x_dec, fused_x3)
         x_dec = self.gltb3(x_dec)
@@ -724,21 +745,93 @@ class SAM3UNetCNNDifussion(nn.Module):
         x_dec = self.wf3(x_dec, fused_x1)
         visual_features = self.gltb1(x_dec)
 
-        # 5. 输出
-        out = self.head(visual_features)
-        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+        coarse_feat = self.head(visual_features)        # [B, num_classes, fH, fW]
+        boundary_feat = self.boundary_head(visual_features)  # [B, 1, fH, fW]
+        return visual_features, coarse_feat, boundary_feat
+
+    def forward(self, x, mask_t=None, t=None):
+        B, C, H, W = x.shape
+
+        visual_features, coarse_feat, boundary_feat = self._extract_features(x)
+
+        # Upsample predictions to original image resolution
+        out = F.interpolate(coarse_feat, size=(H, W), mode='bilinear', align_corners=False)
+        boundary_logits = F.interpolate(boundary_feat, size=(H, W), mode='bilinear', align_corners=False)
 
         if mask_t is not None and t is not None:
-            # 同样，Diffusion 部分也建议动态对齐尺寸
+            # Resize noisy mask to feature-map resolution for diffusion head
             mask_t_input = F.interpolate(mask_t, size=visual_features.shape[2:], mode='bilinear', align_corners=False)
-            noise_pred = self.diffusion_head(mask_t_input, t, visual_features)
+            # Diffusion head conditioned on visual features, coarse prior, and boundary prior
+            noise_pred = self.diffusion_head(mask_t_input, t, visual_features, coarse_feat, boundary_feat)
             noise_pred = F.interpolate(noise_pred, size=(H, W), mode='bilinear', align_corners=False)
-            return out, noise_pred
-        
-        return out
-        # out = self.head(x)
-        # out = F.interpolate(out, size=(H, W), mode='bilinear')
-        # return out
+            return out, boundary_logits, noise_pred
+
+        return out, boundary_logits
+
+    @torch.no_grad()
+    def ddpm_sample(self, x, num_steps=20, T=1000, betas=None):
+        """
+        DDPM reverse sampling for inference.
+        Caches visual features from the discriminative branch and runs the diffusion
+        head for ``num_steps`` denoising steps to produce a refined mask.
+
+        Returns
+        -------
+        refined : torch.Tensor  [B, num_classes, H, W]
+            Refined logits (un-normalised) at the original image resolution.
+        """
+        device = x.device
+        B, _, H, W = x.shape
+
+        if betas is None:
+            betas = torch.linspace(1e-4, 2e-2, T, device=device)
+        else:
+            betas = betas.to(device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # ── Step 1: extract features once (discriminative branch) ──────────
+        visual_features, coarse_feat, boundary_feat = self._extract_features(x)
+        feat_h, feat_w = visual_features.shape[2:]
+        dtype = visual_features.dtype
+
+        # ── Step 2: initialise from pure noise at feature-map resolution ───
+        xt = torch.randn(B, self.num_classes, feat_h, feat_w, device=device, dtype=dtype)
+
+        # ── Step 3: uniformly spaced reverse timesteps ─────────────────────
+        step_indices = torch.linspace(T - 1, 0, num_steps, dtype=torch.long)
+
+        for step in step_indices:
+            step = int(step.item())
+            t_tensor = torch.full((B,), step, device=device, dtype=torch.float32)
+
+            alpha_t = alphas_cumprod[step]
+            alpha_prev = alphas_cumprod[step - 1] if step > 0 else torch.ones(1, device=device)
+            beta_t = betas[step]
+
+            # Predict noise with diffusion head
+            noise_pred = self.diffusion_head(xt, t_tensor, visual_features, coarse_feat, boundary_feat)
+
+            # Predict x_0 from current x_t
+            x0_pred = (xt - (1.0 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt().clamp(min=1e-8)
+            x0_pred = x0_pred.clamp(-1.0, 1.0)
+
+            # Posterior mean (DDPM reverse step)
+            denom = (1.0 - alpha_t).clamp(min=1e-8)
+            coef1 = alpha_prev.sqrt() * beta_t / denom
+            coef2 = alphas[step].sqrt() * (1.0 - alpha_prev) / denom
+            mean = coef1 * x0_pred + coef2 * xt
+
+            if step > 0:
+                var = (beta_t * (1.0 - alpha_prev) / denom).clamp(min=0)
+                xt = mean + var.sqrt() * torch.randn_like(xt)
+            else:
+                xt = mean
+
+        # ── Step 4: upsample refined mask to original resolution ───────────
+        return F.interpolate(xt, size=(H, W), mode='bilinear', align_corners=False)
+
+    
 
     
 # if __name__ == "__main__":
