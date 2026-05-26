@@ -70,6 +70,40 @@ def load_maf_fujian_meta(config_path: str) -> Dict[str, object]:
                     except: pass
     return out
 
+
+def compute_boundary_gt(mask: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
+    """
+    Compute 4-neighbour boundary ground truth from a semantic mask.
+
+    Parameters
+    ----------
+    mask : torch.Tensor  [B, H, W]  long tensor with class labels 0..6 and ignore_index
+    ignore_index : int   pixels with this value are excluded from boundary detection
+
+    Returns
+    -------
+    torch.Tensor  [B, 1, H, W]  float, 1 at boundary pixels, 0 elsewhere
+    """
+    valid = (mask != ignore_index)
+    # Replace ignored pixels with -1 so they don't trigger false boundaries
+    m = mask.clone()
+    m[~valid] = -1
+
+    boundary = torch.zeros_like(m, dtype=torch.float32)
+
+    # Horizontal neighbours
+    diff_h = (m[:, :, 1:] != m[:, :, :-1]) & valid[:, :, 1:] & valid[:, :, :-1]
+    boundary[:, :, 1:]  = boundary[:, :, 1:].masked_fill(diff_h, 1.0)
+    boundary[:, :, :-1] = boundary[:, :, :-1].masked_fill(diff_h, 1.0)
+
+    # Vertical neighbours
+    diff_v = (m[:, 1:, :] != m[:, :-1, :]) & valid[:, 1:, :] & valid[:, :-1, :]
+    boundary[:, 1:, :]  = boundary[:, 1:, :].masked_fill(diff_v, 1.0)
+    boundary[:, :-1, :] = boundary[:, :-1, :].masked_fill(diff_v, 1.0)
+
+    return boundary.unsqueeze(1)  # [B, 1, H, W]
+
+
 # ====================== 改进的数据集类 ======================
 class MAFSegDataset(Dataset):
     def __init__(self, root, split="train", image_size=336, num_classes=7, label_mapping=None):
@@ -201,7 +235,8 @@ def main():
         lr = args.lr
         if "sam3_vit" in n: lr *= 0.1
         elif "eba" in n: lr *= 2.0
-        elif "diffusion_head" in n: lr *= 1.5 # 为扩散头设置较高学习率
+        elif "diffusion_head" in n: lr *= 1.5
+        elif "boundary_head" in n: lr *= 1.5
         params.append({"params": [p], "lr": lr})
 
     optimizer = torch.optim.AdamW(params, weight_decay=1e-4)
@@ -219,56 +254,49 @@ def main():
         running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-        # --- 修改训练循环中的前向部分 ---
         for imgs, masks in pbar:
             imgs, masks = imgs.to(device), masks.to(device)
             optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 B = imgs.shape[0]
-        
-        # 1. 构造 7 通道的 GT One-Hot 掩码 [B, 7, H, W]
-        # 处理 255 标签，防止 one_hot 越界（将其暂时指向背景 0，计算 Loss 时会自动忽略）
-                target_for_onehot = masks.clone()
-                target_for_onehot[target_for_onehot == 255] = 0 
-        
-        # 生成 one_hot 并转为 [B, 7, H, W]
-                gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
-        
-        # 关键：归一化到 [-1, 1] 范围，这是扩散模型的标准分布范围
-                gt_mask = gt_mask * 2.0 - 1.0 
 
-        # 2. 时间步
+                # 1. 构造 7 通道的 GT One-Hot 掩码 [B, 7, H, W]
+                # 处理 255 标签，防止 one_hot 越界
+                target_for_onehot = masks.clone()
+                target_for_onehot[target_for_onehot == 255] = 0
+
+                # 生成 one_hot 并转为 [B, 7, H, W]，归一化到 [-1, 1]
+                gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+                gt_mask = gt_mask * 2.0 - 1.0
+
+                # 2. 提取 4-邻域边界 GT [B, 1, H, W]
+                boundary_gt = compute_boundary_gt(masks, ignore_index=255).to(device)
+
+                # 3. 时间步
                 t = torch.randint(0, T, (B,), device=device).float()
 
-        # 3. 扩散加噪 (7通道噪声)
+                # 4. 扩散加噪 (7通道噪声)
                 noise = torch.randn_like(gt_mask)
-        
-        # 提取系数并对齐维度 [B, 1, 1, 1]
                 s_alpha = sqrt_alphas_cumprod[t.long()].view(B, 1, 1, 1)
                 s_noise = sqrt_one_minus_alphas_cumprod[t.long()].view(B, 1, 1, 1)
-        
-        # 生成带噪掩码
                 noisy_mask = s_alpha * gt_mask + s_noise * noise
 
-        # 4. 模型前向 (此时 noisy_mask 是 7 通道)
-                logits, noise_pred = model(imgs, noisy_mask, t)
+                # 5. 模型前向：返回 (coarse_logits, boundary_logits, noise_pred)
+                coarse_logits, boundary_logits, noise_pred = model(imgs, noisy_mask, t)
 
-        # 5. 计算损失
-        # logits: [B, 7, H, W] -> 与 masks(类别索引) 算交叉熵
-        # noise_pred: [B, 7, H, W] -> 与 noise 算 MSE
-                loss = criterion(logits, masks, noise_pred, noise)
+                # 6. 计算综合损失
+                loss = criterion(coarse_logits, masks, boundary_logits, boundary_gt, noise_pred, noise)
 
-    # 反向传播 ...
-    # 反向传播
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+            # 反向传播
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
-        running_loss += loss.item()
-        pbar.set_postfix(loss=f"{running_loss/(pbar.n+1):.4f}")
+            running_loss += loss.item()
+            pbar.set_postfix(loss=f"{running_loss/(pbar.n+1):.4f}")
 
         # 评估与记录
         metrics = evaluate(model, val_loader, device, 7)

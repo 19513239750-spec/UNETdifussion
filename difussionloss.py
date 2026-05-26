@@ -39,86 +39,71 @@ class DiffusionLoss(nn.Module):
         self.diffusion_weight = diffusion_weight
         self.ignore_index = ignore_index
         
-        # 现在 FocalLoss 已经定义，不会再报错
         self.focal_loss = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=ignore_index)
-        self.mse_loss = nn.MSELoss() 
+        self.mse_loss = nn.MSELoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
 
     def forward(self, 
-                logits: torch.Tensor, 
-                targets: torch.Tensor, 
-                noise_pred: torch.Tensor = None, 
-                true_noise: torch.Tensor = None  
+                coarse_logits: torch.Tensor,
+                targets: torch.Tensor,
+                boundary_logits: torch.Tensor = None,
+                boundary_gt: torch.Tensor = None,
+                noise_pred: torch.Tensor = None,
+                true_noise: torch.Tensor = None
                 ) -> torch.Tensor:
-        
-        logits = logits.float() 
-        
-        # 1. 基础分割损失 (Focal + Dice)
-        loss_focal = self.focal_loss(logits, targets)
-        
-        num_classes = logits.shape[1]
-        probs = F.softmax(logits, dim=1)
+        """
+        Parameters
+        ----------
+        coarse_logits   : [B, num_classes, H, W]  coarse segmentation logits
+        targets         : [B, H, W]  integer labels 0..6, ignore_index=255
+        boundary_logits : [B, 1, H, W]  boundary prediction logits (optional)
+        boundary_gt     : [B, 1, H, W]  binary boundary ground truth (optional)
+        noise_pred      : [B, num_classes, H, W]  predicted noise (optional)
+        true_noise      : [B, num_classes, H, W]  ground-truth noise (optional)
+        """
+        coarse_logits = coarse_logits.float()
+
+        # ── 1. Coarse segmentation loss (Focal + Dice) ──────────────────────
+        loss_focal = self.focal_loss(coarse_logits, targets)
+
+        num_classes = coarse_logits.shape[1]
+        probs = F.softmax(coarse_logits, dim=1)
         valid_mask = (targets != self.ignore_index).unsqueeze(1)
-        
+
         targets_safe = torch.where(targets == self.ignore_index, torch.zeros_like(targets), targets)
         targets_onehot = F.one_hot(targets_safe, num_classes=num_classes).permute(0, 3, 1, 2).float()
-        
-        probs = probs * valid_mask
-        targets_onehot = targets_onehot * valid_mask
 
-        loss_dice = self._compute_dice(probs, targets_onehot)
+        probs_masked = probs * valid_mask
+        targets_onehot_masked = targets_onehot * valid_mask
 
-        # 2. 增强型边界分离损失
-        loss_boundary = self._compute_separation_boundary_loss(probs, targets_onehot)
+        loss_dice = self._compute_dice(probs_masked, targets_onehot_masked)
 
-        # 3. Diffusion 噪声损失
-        loss_diffusion = 0
+        # ── 2. Boundary loss ────────────────────────────────────────────────
+        if boundary_logits is not None and boundary_gt is not None:
+            # Explicit binary boundary supervision (BCE)
+            bl = boundary_logits.float()
+            if bl.shape != boundary_gt.shape:
+                bl = F.interpolate(bl, size=boundary_gt.shape[2:], mode='bilinear', align_corners=False)
+            loss_boundary = self.bce_loss(bl, boundary_gt.float())
+        else:
+            # Fallback: implicit boundary separation loss from probs
+            loss_boundary = self._compute_separation_boundary_loss(probs_masked, targets_onehot_masked)
+
+        # ── 3. Diffusion noise prediction loss (MSE) ─────────────────────────
+        loss_diffusion = torch.tensor(0.0, device=coarse_logits.device)
         if noise_pred is not None and true_noise is not None:
-            # 确保尺寸一致
-            if noise_pred.shape != true_noise.shape:
-                noise_pred = F.interpolate(noise_pred, size=true_noise.shape[2:], mode='bilinear', align_corners=False)
-            loss_diffusion = self.mse_loss(noise_pred, true_noise)
+            np_ = noise_pred.float()
+            if np_.shape != true_noise.shape:
+                np_ = F.interpolate(np_, size=true_noise.shape[2:], mode='bilinear', align_corners=False)
+            loss_diffusion = self.mse_loss(np_, true_noise.float())
 
-        # 综合损失
-        total_loss = (self.focal_weight * loss_focal + 
-                      self.dice_weight * loss_dice + 
+        # ── Total loss ────────────────────────────────────────────────────────
+        total_loss = (self.focal_weight * loss_focal +
+                      self.dice_weight * loss_dice +
                       self.boundary_weight * loss_boundary +
                       self.diffusion_weight * loss_diffusion)
-        
+
         return total_loss
-    
-
-    # def _compute_separation_boundary_loss(self, probs, targets_onehot, eps=1e-5):
-    #     """
-    #     改进：重点惩罚 False Positive (FP)，即本该是间隙却连在一起的部分。
-    #     """
-    #     k_size = 5 # 对于极小的浮阀，可以尝试 k_size=3；对于大池塘，k_size=5 较好
-        
-    #     # 1. 提取真值边界
-    #     targets_max = F.max_pool2d(targets_onehot, kernel_size=k_size, stride=1, padding=k_size//2)
-    #     targets_min = -F.max_pool2d(-targets_onehot, kernel_size=k_size, stride=1, padding=k_size//2)
-    #     boundary_targets = targets_max - targets_min 
-
-    #     # 2. 提取预测边界
-    #     probs_max = F.max_pool2d(probs, kernel_size=k_size, stride=1, padding=k_size//2)
-    #     probs_min = -F.max_pool2d(-probs, kernel_size=k_size, stride=1, padding=k_size//2)
-    #     boundary_preds = probs_max - probs_min
-
-    #     # 3. 计算交集和错位
-    #     intersection = torch.sum(boundary_preds * boundary_targets, dim=(2, 3))
-        
-    #     # FP: 预测为边界但实际不是（即模型在间隙处乱涂，导致黏连）
-    #     fp = torch.sum(boundary_preds * (1 - boundary_targets), dim=(2, 3)) 
-    #     # FN: 实际是边界但没预测出来（即边界丢失）
-    #     fn = torch.sum((1 - boundary_preds) * boundary_targets, dim=(2, 3))
-        
-    #     # --- 核心调整点 ---
-    #     # 原始：0.7 * fn + 0.3 * fp (侧重找回边界)
-    #     # 建议：0.3 * fn + 0.8 * fp (侧重严惩黏连/多余预测)
-    #     # 提高 FP 的权重，会让模型在面对“到底连不连”时，倾向于“断开”以降低 FP。
-    #     boundary_score = (intersection + eps) / (intersection + 0.3 * fn + 0.8 * fp + eps)
-        
-    #     return 1.0 - boundary_score.mean()
-
 
     def _compute_separation_boundary_loss(self, probs, targets_onehot, eps=1e-5):
         k_size = 5 
