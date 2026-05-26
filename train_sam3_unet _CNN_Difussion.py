@@ -26,13 +26,6 @@ from albumentations.pytorch import ToTensorV2
 from sam3_unet.loss.difussionloss import DiffusionLoss
 
 
-
-T = 1000
-betas = torch.linspace(1e-4, 2e-2, T)
-alphas = 1.0 - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0)
-sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod).cuda()
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod).cuda()
 # ====================== 绘图库 ======================
 import matplotlib.pyplot as plt
 plt.rcParams["figure.figsize"] = (10, 8)
@@ -260,33 +253,35 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 B = imgs.shape[0]
-
-                # 1. 构造 7 通道的 GT One-Hot 掩码 [B, 7, H, W]
-                # 处理 255 标签，防止 one_hot 越界
-                target_for_onehot = masks.clone()
-                target_for_onehot[target_for_onehot == 255] = 0
-
-                # 生成 one_hot 并转为 [B, 7, H, W]，归一化到 [-1, 1]
-                gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
-                gt_mask = gt_mask * 2.0 - 1.0
-
-                # 2. 提取 4-邻域边界 GT [B, 1, H, W]
+                # 1. 提取 4-邻域边界 GT [B, 1, H, W]
                 boundary_gt = compute_boundary_gt(masks, ignore_index=255).to(device)
 
-                # 3. 时间步
-                t = torch.randint(0, T, (B,), device=device).float()
+                # 2. 先获得 coarse/boundary 预测
+                coarse_logits, boundary_logits = model(imgs)
 
-                # 4. 扩散加噪 (7通道噪声)
-                noise = torch.randn_like(gt_mask)
-                s_alpha = sqrt_alphas_cumprod[t.long()].view(B, 1, 1, 1)
-                s_noise = sqrt_one_minus_alphas_cumprod[t.long()].view(B, 1, 1, 1)
-                noisy_mask = s_alpha * gt_mask + s_noise * noise
+                # 3. 使用 coarse logits 的轻微扰动作为 refinement 输入
+                valid_mask = (masks != 255).unsqueeze(1).float()
+                noisy_mask = coarse_logits.detach() + 0.10 * torch.randn_like(coarse_logits) * valid_mask
+                t = torch.randint(0, 4, (B,), device=device).float()
 
-                # 5. 模型前向：返回 (coarse_logits, boundary_logits, noise_pred)
-                coarse_logits, boundary_logits, noise_pred = model(imgs, noisy_mask, t)
+                # 4. refinement 分支输出 residual correction
+                _, _, residual_pred = model(imgs, noisy_mask, t)
+
+                # 5. residual 监督目标: gt_onehot - current_mask
+                target_for_onehot = masks.clone()
+                target_for_onehot[target_for_onehot == 255] = 0
+                gt_onehot = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+                residual_target = (gt_onehot - noisy_mask) * valid_mask
 
                 # 6. 计算综合损失
-                loss = criterion(coarse_logits, masks, boundary_logits, boundary_gt, noise_pred, noise)
+                loss = criterion(
+                    coarse_logits,
+                    masks,
+                    boundary_logits,
+                    boundary_gt,
+                    refinement_pred=residual_pred,
+                    refinement_target=residual_target,
+                )
 
             # 反向传播
             scaler.scale(loss).backward()

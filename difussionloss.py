@@ -40,7 +40,6 @@ class DiffusionLoss(nn.Module):
         self.ignore_index = ignore_index
         
         self.focal_loss = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=ignore_index)
-        self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
 
     def forward(self, 
@@ -48,6 +47,8 @@ class DiffusionLoss(nn.Module):
                 targets: torch.Tensor,
                 boundary_logits: torch.Tensor = None,
                 boundary_gt: torch.Tensor = None,
+                refinement_pred: torch.Tensor = None,
+                refinement_target: torch.Tensor = None,
                 noise_pred: torch.Tensor = None,
                 true_noise: torch.Tensor = None
                 ) -> torch.Tensor:
@@ -58,8 +59,8 @@ class DiffusionLoss(nn.Module):
         targets         : [B, H, W]  integer labels 0..6, ignore_index=255
         boundary_logits : [B, 1, H, W]  boundary prediction logits (optional)
         boundary_gt     : [B, 1, H, W]  binary boundary ground truth (optional)
-        noise_pred      : [B, num_classes, H, W]  predicted noise (optional)
-        true_noise      : [B, num_classes, H, W]  ground-truth noise (optional)
+        refinement_pred   : [B, num_classes, H, W] predicted residual/correction logits (optional)
+        refinement_target : [B, num_classes, H, W] residual/correction supervision target (optional)
         """
         coarse_logits = coarse_logits.float()
 
@@ -89,13 +90,20 @@ class DiffusionLoss(nn.Module):
             # Fallback: implicit boundary separation loss from probs
             loss_boundary = self._compute_separation_boundary_loss(probs_masked, targets_onehot_masked)
 
-        # ── 3. Diffusion noise prediction loss (MSE) ─────────────────────────
+        # ── 3. Refinement residual loss (MSE on valid pixels) ───────────────
         loss_diffusion = torch.tensor(0.0, device=coarse_logits.device)
-        if noise_pred is not None and true_noise is not None:
-            np_ = noise_pred.float()
-            if np_.shape != true_noise.shape:
-                np_ = F.interpolate(np_, size=true_noise.shape[2:], mode='bilinear', align_corners=False)
-            loss_diffusion = self.mse_loss(np_, true_noise.float())
+        rp = refinement_pred if refinement_pred is not None else noise_pred
+        rt = refinement_target if refinement_target is not None else true_noise
+        if rp is not None and rt is not None:
+            rp = rp.float()
+            rt = rt.float()
+            if rp.shape != rt.shape:
+                rp = F.interpolate(rp, size=rt.shape[2:], mode='bilinear', align_corners=False)
+            valid_mask_f = valid_mask.float()
+            sq_err = (rp - rt) ** 2
+            sq_err = sq_err * valid_mask_f
+            denom = valid_mask_f.sum() * rp.shape[1] + 1e-6
+            loss_diffusion = sq_err.sum() / denom
 
         # ── Total loss ────────────────────────────────────────────────────────
         total_loss = (self.focal_weight * loss_focal +

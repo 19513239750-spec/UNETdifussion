@@ -31,8 +31,8 @@ SAVE_DIR = "/workspace/weights/SAM3UNetDiffusion2/test_results"
 IMAGE_SIZE = 336
 NUM_CLASSES = 7
 
-# DDPM 反向采样步数 (减小可加速推理，增大可提升精度)
-DDPM_NUM_STEPS = 20
+# coarse-conditioned refinement 迭代步数
+REFINE_NUM_STEPS = 4
 
 # ====================== 2. 动态加载模型 ======================
 def _load_model_cls(py_path):
@@ -118,19 +118,15 @@ def run_test():
     model.eval()
     print(f"Successfully loaded weights from {CHECKPOINT_PATH}")
 
-    # 3. 预先构建 DDPM 噪声调度表 (与训练一致)
-    T = 1000
-    betas = torch.linspace(1e-4, 2e-2, T, device=device)
-
-    # 4. 数据准备
+    # 3. 数据准备
     dataset = MAFSegTestDataset(DATA_ROOT, split="test", image_size=IMAGE_SIZE, label_mapping=gt_map)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
 
-    # 5. 指标容器 (coarse + diffusion-refined)
+    # 4. 指标容器 (coarse + refined)
     conf_coarse  = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.float64, device=device)
     conf_refined = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.float64, device=device)
 
-    print("Starting Inference (coarse + DDPM refinement)...")
+    print("Starting Inference (coarse + local refinement)...")
     for imgs, masks, filenames in tqdm(loader):
         imgs, masks = imgs.to(device), masks.to(device)
         
@@ -138,8 +134,8 @@ def run_test():
         coarse_out, _ = model(imgs)          # (coarse_logits, boundary_logits)
         pred_coarse = coarse_out.argmax(dim=1)
 
-        # ── DDPM refined prediction ─────────────────────────────────────────
-        refined_mask = model.ddpm_sample(imgs, num_steps=DDPM_NUM_STEPS, T=T, betas=betas)
+        # ── Coarse-conditioned local refinement ─────────────────────────────
+        refined_mask = model.refine_from_coarse(imgs, num_steps=REFINE_NUM_STEPS)
         pred_refined = refined_mask.argmax(dim=1)
 
         # ── Update confusion matrices ────────────────────────────────────────

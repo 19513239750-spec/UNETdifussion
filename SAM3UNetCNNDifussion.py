@@ -385,6 +385,7 @@ class MaskDiffusionHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         self.mask_in = nn.Conv2d(num_classes, hidden_dim, kernel_size=3, padding=1)
+        self.cond_proj = nn.Conv2d(feature_dim + num_classes + 1, hidden_dim, kernel_size=1)
         self.res_block = AdaGN_ResidualBlock(hidden_dim, hidden_dim)
         self.out_conv = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
@@ -396,14 +397,21 @@ class MaskDiffusionHead(nn.Module):
         coarse_logits:  [B, num_classes, H, W]  coarse segmentation prior
         boundary_logits:[B, 1, H, W]             boundary prior
         """
+        cond_feat = F.interpolate(cond_feat, size=x_t.shape[2:], mode='bilinear', align_corners=False)
+        coarse_logits = F.interpolate(coarse_logits, size=x_t.shape[2:], mode='bilinear', align_corners=False)
+        boundary_logits = F.interpolate(boundary_logits, size=x_t.shape[2:], mode='bilinear', align_corners=False)
+
         global_feat = F.adaptive_avg_pool2d(cond_feat, 1).flatten(1)
         coarse_global = F.adaptive_avg_pool2d(coarse_logits, 1).flatten(1)
         boundary_global = F.adaptive_avg_pool2d(boundary_logits, 1).flatten(1)
+        if t is None:
+            t = torch.zeros(x_t.shape[0], device=x_t.device, dtype=x_t.dtype)
         t_input = torch.cat(
             [t.view(-1, 1).to(x_t.dtype), global_feat, coarse_global, boundary_global], dim=1
         )
         c_emb = self.cond_mlp(t_input)
-        x = self.mask_in(x_t)
+        cond_local = self.cond_proj(torch.cat([cond_feat, coarse_logits, boundary_logits], dim=1))
+        x = self.mask_in(x_t) + cond_local
         x = self.res_block(x, c_emb)
         return self.out_conv(x)
 
@@ -758,78 +766,43 @@ class SAM3UNetCNNDifussionv2(nn.Module):
         out = F.interpolate(coarse_feat, size=(H, W), mode='bilinear', align_corners=False)
         boundary_logits = F.interpolate(boundary_feat, size=(H, W), mode='bilinear', align_corners=False)
 
-        if mask_t is not None and t is not None:
-            # Resize noisy mask to feature-map resolution for diffusion head
+        if mask_t is not None:
+            # Resize current refinement mask to feature-map resolution for refinement head
             mask_t_input = F.interpolate(mask_t, size=visual_features.shape[2:], mode='bilinear', align_corners=False)
-            # Diffusion head conditioned on visual features, coarse prior, and boundary prior
-            noise_pred = self.diffusion_head(mask_t_input, t, visual_features, coarse_feat, boundary_feat)
-            noise_pred = F.interpolate(noise_pred, size=(H, W), mode='bilinear', align_corners=False)
-            return out, boundary_logits, noise_pred
+            # Predict residual correction conditioned on visual/coarse/boundary priors
+            residual_pred = self.diffusion_head(mask_t_input, t, visual_features, coarse_feat, boundary_feat)
+            residual_pred = F.interpolate(residual_pred, size=(H, W), mode='bilinear', align_corners=False)
+            return out, boundary_logits, residual_pred
 
         return out, boundary_logits
 
     @torch.no_grad()
-    def ddpm_sample(self, x, num_steps=20, T=1000, betas=None):
-        """
-        DDPM reverse sampling for inference.
-        Caches visual features from the discriminative branch and runs the diffusion
-        head for ``num_steps`` denoising steps to produce a refined mask.
-
-        Returns
-        -------
-        refined : torch.Tensor  [B, num_classes, H, W]
-            Refined logits (un-normalised) at the original image resolution.
-        """
+    def refine_from_coarse(self, x, init_mask=None, num_steps=4, step_size=0.5, perturb_std=0.0):
+        """Coarse-conditioned local refinement for inference."""
         device = x.device
         B, _, H, W = x.shape
 
-        if betas is None:
-            betas = torch.linspace(1e-4, 2e-2, T, device=device)
-        else:
-            betas = betas.to(device)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-
-        # ── Step 1: extract features once (discriminative branch) ──────────
         visual_features, coarse_feat, boundary_feat = self._extract_features(x)
         feat_h, feat_w = visual_features.shape[2:]
-        dtype = visual_features.dtype
+        if init_mask is None:
+            xt = coarse_feat
+        else:
+            xt = F.interpolate(init_mask, size=(feat_h, feat_w), mode='bilinear', align_corners=False)
+        if perturb_std > 0:
+            xt = xt + perturb_std * torch.randn_like(xt)
 
-        # ── Step 2: initialise from pure noise at feature-map resolution ───
-        xt = torch.randn(B, self.num_classes, feat_h, feat_w, device=device, dtype=dtype)
+        edge_gate = 1.0 + torch.sigmoid(boundary_feat)
+        for i in range(max(int(num_steps), 1)):
+            t_tensor = torch.full((B,), float(i), device=device, dtype=xt.dtype)
+            residual = self.diffusion_head(xt, t_tensor, visual_features, coarse_feat, boundary_feat)
+            xt = xt + step_size * residual * edge_gate
 
-        # ── Step 3: uniformly spaced reverse timesteps ─────────────────────
-        step_indices = torch.linspace(T - 1, 0, num_steps, dtype=torch.long)
-
-        for step in step_indices:
-            step = int(step.item())
-            t_tensor = torch.full((B,), step, device=device, dtype=torch.float32)
-
-            alpha_t = alphas_cumprod[step]
-            alpha_prev = alphas_cumprod[step - 1] if step > 0 else torch.ones(1, device=device)
-            beta_t = betas[step]
-
-            # Predict noise with diffusion head
-            noise_pred = self.diffusion_head(xt, t_tensor, visual_features, coarse_feat, boundary_feat)
-
-            # Predict x_0 from current x_t
-            x0_pred = (xt - (1.0 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt().clamp(min=1e-8)
-            x0_pred = x0_pred.clamp(-1.0, 1.0)
-
-            # Posterior mean (DDPM reverse step)
-            denom = (1.0 - alpha_t).clamp(min=1e-8)
-            coef1 = alpha_prev.sqrt() * beta_t / denom
-            coef2 = alphas[step].sqrt() * (1.0 - alpha_prev) / denom
-            mean = coef1 * x0_pred + coef2 * xt
-
-            if step > 0:
-                var = (beta_t * (1.0 - alpha_prev) / denom).clamp(min=0)
-                xt = mean + var.sqrt() * torch.randn_like(xt)
-            else:
-                xt = mean
-
-        # ── Step 4: upsample refined mask to original resolution ───────────
         return F.interpolate(xt, size=(H, W), mode='bilinear', align_corners=False)
+
+    @torch.no_grad()
+    def ddpm_sample(self, x, num_steps=4, T=1000, betas=None):
+        """Backward-compatible alias for coarse-conditioned refinement."""
+        return self.refine_from_coarse(x, num_steps=num_steps)
 
     
 
@@ -840,4 +813,3 @@ class SAM3UNetCNNDifussionv2(nn.Module):
 #         x = torch.randn(1, 3, 336, 336).cuda()
 #         out = model(x)
 #         print(out.shape)
-
