@@ -249,6 +249,8 @@ def plot_curves(epochs, losses, mious, fwious, accs, save_path):
 # ====================== 主训练函数 ======================
 def main():
     parser = argparse.ArgumentParser()
+    # stage1: train backbone coarse segmentation with CE + Dice + Focal
+    # stage2: freeze backbone and train conditional diffusion refinement with noise MSE
     parser.add_argument("--data_root", type=str, default="/workspace/MAF")
     parser.add_argument("--sam3_ckpt", type=str, default="/workspace/sam3/sam3.pt")
     parser.add_argument("--init_weights", type=str, default="", help="Optional checkpoint to resume stage training")
