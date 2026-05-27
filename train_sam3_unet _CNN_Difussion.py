@@ -23,9 +23,9 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 try:
-    from sam3_unet.loss.difussionloss import FocalLoss
+    from sam3_unet.loss.difussionloss import FocalLoss, DiffusionLoss
 except ModuleNotFoundError:
-    from difussionloss import FocalLoss
+    from difussionloss import FocalLoss, DiffusionLoss
 
 # ====================== 绘图库 ======================
 import matplotlib.pyplot as plt
@@ -318,7 +318,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     stage1_criterion = Stage1SegLoss(num_classes=7, ignore_index=255).to(device)
-    stage2_criterion = nn.MSELoss().to(device)
+    stage2_criterion = DiffusionLoss(focal_weight=0.0, dice_weight=0.0,
+                                     boundary_weight=0.0, diffusion_weight=1.0,
+                                     repa_weight=0.5).to(device)
     diffusion_schedule = build_diffusion_schedule(args.diffusion_steps, device) if args.train_stage == "stage2" else None
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -342,15 +344,23 @@ def main():
                     loss = stage1_criterion(coarse_logits, masks, boundary_logits, boundary_gt)
                 else:
                     B = imgs.shape[0]
+                    with torch.no_grad():
+                        teacher_feat, _, _ = model._extract_features(imgs)
                     target_for_onehot = masks.clone()
                     target_for_onehot[target_for_onehot == 255] = 0
                     gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
-                    t = sample_timesteps(B, diffusion_schedule["T"], device).float()
+                    t = sample_timesteps(B, diffusion_schedule["T"], device)
+                    t_float = t.float()
                     # Latent diffusion: encode GT mask into latent space before noising.
                     gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
-                    noisy_latent, true_noise = add_mask_noise(gt_latent, t, diffusion_schedule)
-                    _, _, noise_pred = model(imgs, noisy_latent, t)
-                    loss = stage2_criterion(noise_pred, true_noise)
+                    noisy_latent, true_noise = add_mask_noise(gt_latent, t_float, diffusion_schedule)
+                    coarse_logits, boundary_logits, noise_pred, repa_feat = model(imgs, noisy_latent, t_float)
+                    loss = stage2_criterion(coarse_logits, masks,
+                                            boundary_logits=boundary_logits,
+                                            noise_pred=noise_pred,
+                                            true_noise=true_noise,
+                                            repa_feat=repa_feat,
+                                            teacher_feat=teacher_feat)
 
             # 反向传播
             scaler.scale(loss).backward()

@@ -135,11 +135,12 @@ def run_test():
         imgs, masks = imgs.to(device), masks.to(device)
         
         # ── Coarse prediction (discriminative branch) ──────────────────────
-        coarse_out, _ = model(imgs)          # (coarse_logits, boundary_logits)
+        outputs = model(imgs)
+        coarse_out = outputs[0]          # (coarse_logits, boundary_logits)
         pred_coarse = coarse_out.argmax(dim=1)
 
         # ── DDPM refined prediction ─────────────────────────────────────────
-        refined_mask = model.ddpm_sample(imgs, num_steps=DDPM_NUM_STEPS, T=T, betas=betas)
+        refined_mask = model.refine_sample(imgs, t_start=200, num_steps=5, T=T, betas=betas)
         pred_refined = refined_mask.argmax(dim=1)
 
         # ── Update confusion matrices ────────────────────────────────────────

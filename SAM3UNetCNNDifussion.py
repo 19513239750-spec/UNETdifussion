@@ -431,13 +431,20 @@ class LatentDecoder(nn.Module):
 class MaskDiffusionHead(nn.Module):
     def __init__(self, latent_channels=4, hidden_dim=128, num_heads=8):
         super().__init__()
-        cond_channels = latent_channels + latent_channels + 1
+        guidance_channels = latent_channels + latent_channels
+        local_channels = guidance_channels + 1
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         self.mask_in = nn.Conv2d(latent_channels, hidden_dim, kernel_size=3, padding=1)
-        self.guidance_in = nn.Conv2d(cond_channels, hidden_dim, kernel_size=1)
-        self.zero_conv = nn.Conv2d(hidden_dim + cond_channels, hidden_dim, kernel_size=1)
+        self.guidance_in = nn.Conv2d(guidance_channels, hidden_dim, kernel_size=1)
+        self.zero_conv = nn.Conv2d(hidden_dim + local_channels, hidden_dim, kernel_size=1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
         self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
+        self.repa_head = nn.Conv2d(hidden_dim, 128, kernel_size=1)
         self.out_conv = nn.Conv2d(hidden_dim, latent_channels, kernel_size=1)
 
     def forward(self, x_t, t, image_latent, coarse_latent, boundary_logits):
@@ -448,20 +455,25 @@ class MaskDiffusionHead(nn.Module):
         coarse_latent:  [B, latent_channels, H, W]  coarse mask latent condition
         boundary_logits:[B, 1, H, W]             boundary prior
         """
-        f_z_t = self.mask_in(x_t)
-        guidance = torch.cat([image_latent, coarse_latent, boundary_logits], dim=1)
-        local_input = torch.cat([f_z_t, guidance], dim=1)
+        t_embed = self.time_mlp(t.view(-1, 1).to(dtype=x_t.dtype)).unsqueeze(-1).unsqueeze(-1)
+        f_z_t = self.mask_in(x_t) + t_embed
+
+        guidance_kv = torch.cat([image_latent, coarse_latent], dim=1)
+        local_guidance = torch.cat([image_latent, coarse_latent, boundary_logits], dim=1)
+        local_input = torch.cat([f_z_t, local_guidance], dim=1)
         f_prime = self.zero_conv(local_input)
 
-        guidance_proj = self.guidance_in(guidance)
+        guidance_proj = self.guidance_in(guidance_kv)
         bsz, ch, h, w = f_prime.shape
         query = f_prime.flatten(2).transpose(1, 2)
         key = guidance_proj.flatten(2).transpose(1, 2)
         attn_out, _ = self.cross_attn(query, key, key)
         attn_out = attn_out.transpose(1, 2).reshape(bsz, ch, h, w)
 
-        out = f_prime + attn_out
-        return self.out_conv(out)
+        fused = f_prime + attn_out
+        noise_pred = self.out_conv(fused)
+        repa_feat = self.repa_head(fused)
+        return noise_pred, repa_feat
 
 
 class BoundaryHead(nn.Module):
@@ -924,16 +936,15 @@ class SAM3UNetCNNDifussion(nn.Module):
                 image_latent = F.interpolate(image_latent, size=mask_t_input.shape[2:], mode='bilinear', align_corners=False)
             boundary_cond = F.interpolate(boundary_logits, size=mask_t_input.shape[2:], mode='bilinear', align_corners=False)
 
-            noise_pred = self.diffusion_head(mask_t_input, t, image_latent, coarse_latent, boundary_cond)
-            return out, boundary_logits, noise_pred
+            noise_pred, repa_feat = self.diffusion_head(mask_t_input, t, image_latent, coarse_latent, boundary_cond)
+            return out, boundary_logits, noise_pred, repa_feat
 
         return out, boundary_logits
 
     @torch.no_grad()
-    def ddpm_sample(self, x, num_steps=20, T=1000, betas=None, eta: float = 0.0):
+    def refine_sample(self, x, t_start: int = 200, num_steps: int = 5, T: int = 1000, betas=None, eta: float = 0.0):
         """
-        DDIM reverse sampling for inference (eta=0 for deterministic).
-        Uses latent diffusion conditioned on image latent, coarse mask latent, and boundary logits.
+        DDIM refinement sampling starting from the coarse mask latent with light noise injection.
 
         Returns
         -------
@@ -962,11 +973,13 @@ class SAM3UNetCNNDifussion(nn.Module):
             image_latent = F.interpolate(image_latent, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
         boundary_cond = F.interpolate(boundary_logits, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
 
-        # ── Step 2: initialise from pure noise in latent space ────────────
-        xt = torch.randn_like(coarse_latent)
+        # ── Step 2: inject light noise at t_start ─────────────────────────
+        t_start = int(max(0, min(t_start, T - 1)))
+        alpha_t = alphas_cumprod[t_start]
+        xt = alpha_t.sqrt() * coarse_latent + (1.0 - alpha_t).sqrt() * torch.randn_like(coarse_latent)
 
-        # ── Step 3: uniformly spaced reverse timesteps ────────────────────
-        step_indices = torch.linspace(T - 1, 0, num_steps, dtype=torch.long, device=device)
+        # ── Step 3: DDIM refinement steps ────────────────────────────────
+        step_indices = torch.linspace(t_start, 0, num_steps, dtype=torch.long, device=device)
         step_indices = [int(s.item()) for s in step_indices]
 
         for idx, step in enumerate(step_indices):
@@ -975,7 +988,7 @@ class SAM3UNetCNNDifussion(nn.Module):
             prev_step = step_indices[idx + 1] if idx + 1 < len(step_indices) else -1
             alpha_prev = alphas_cumprod[prev_step] if prev_step >= 0 else torch.ones(1, device=device)
 
-            noise_pred = self.diffusion_head(xt, t_tensor, image_latent, coarse_latent, boundary_cond)
+            noise_pred, _ = self.diffusion_head(xt, t_tensor, image_latent, coarse_latent, boundary_cond)
 
             x0_pred = (xt - (1.0 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-1.0, 1.0)
@@ -990,6 +1003,9 @@ class SAM3UNetCNNDifussion(nn.Module):
         # ── Step 4: decode latent mask and upsample to original resolution ─
         refined_logits = self.decode_mask_latent(xt)
         return F.interpolate(refined_logits, size=(H, W), mode='bilinear', align_corners=False)
+
+    def ddpm_sample(self, x, num_steps=20, T=1000, betas=None, eta: float = 0.0):
+        return self.refine_sample(x, t_start=T - 1, num_steps=num_steps, T=T, betas=betas, eta=eta)
 
     
 
