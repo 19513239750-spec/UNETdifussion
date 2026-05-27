@@ -722,6 +722,58 @@ class SAM3UNetCNNDifussion(nn.Module):
         self.eba_2 = EBAModule(channels=128)
         self.eba_3 = EBAModule(channels=128)
         self.eba_4 = EBAModule(channels=128)
+        self._default_requires_grad = {n: p.requires_grad for n, p in self.named_parameters()}
+        self._train_stage = "stage1"
+
+    def _set_module_requires_grad(self, module: nn.Module, requires_grad: bool):
+        for p in module.parameters():
+            p.requires_grad = requires_grad
+
+    def _backbone_modules(self):
+        return [
+            self.sam3_vit,
+            self.cnn_branch,
+            self.reduce1, self.reduce2, self.reduce3, self.reduce4,
+            self.up1, self.up2, self.up3, self.up4,
+            self.head,
+            self.wf1, self.wf2, self.wf3,
+            self.gltb1, self.gltb2, self.gltb3, self.gltb4,
+            self.eba_1, self.eba_2, self.eba_3, self.eba_4,
+        ]
+
+    def _diffusion_modules(self):
+        return [self.boundary_head, self.diffusion_head]
+
+    def configure_training_stage(self, stage: str = "stage1"):
+        """
+        stage1: train backbone (coarse segmentation) only.
+        stage2: freeze backbone and train diffusion refinement only.
+        """
+        if stage not in {"stage1", "stage2"}:
+            raise ValueError(f"Unsupported training stage: {stage}")
+        self._train_stage = stage
+
+        if stage == "stage1":
+            for n, p in self.named_parameters():
+                p.requires_grad = self._default_requires_grad.get(n, True)
+                if n.startswith("diffusion_head.") or n.startswith("boundary_head."):
+                    p.requires_grad = False
+        else:
+            for n, p in self.named_parameters():
+                p.requires_grad = n.startswith("diffusion_head.") or n.startswith("boundary_head.")
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep frozen submodules in eval mode to avoid BN/running-stat updates.
+        if mode and self._train_stage == "stage1":
+            for m in self._diffusion_modules():
+                m.eval()
+        if mode and self._train_stage == "stage2":
+            for m in self._backbone_modules():
+                m.eval()
+        return self
+
     def _extract_features(self, x):
         """Extract visual features, coarse logits, and boundary logits at feature-map resolution."""
         vit_feat = self.sam3_vit(x)[-1]
@@ -840,4 +892,3 @@ class SAM3UNetCNNDifussion(nn.Module):
 #         x = torch.randn(1, 3, 336, 336).cuda()
 #         out = model(x)
 #         print(out.shape)
-

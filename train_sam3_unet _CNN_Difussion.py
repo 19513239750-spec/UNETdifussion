@@ -22,17 +22,11 @@ from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# 假设您已经定义好了这个 Loss 类
-from sam3_unet.loss.difussionloss import DiffusionLoss
+try:
+    from sam3_unet.loss.difussionloss import FocalLoss
+except ModuleNotFoundError:
+    from difussionloss import FocalLoss
 
-
-
-T = 1000
-betas = torch.linspace(1e-4, 2e-2, T)
-alphas = 1.0 - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0)
-sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod).cuda()
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod).cuda()
 # ====================== 绘图库 ======================
 import matplotlib.pyplot as plt
 plt.rcParams["figure.figsize"] = (10, 8)
@@ -102,6 +96,56 @@ def compute_boundary_gt(mask: torch.Tensor, ignore_index: int = 255) -> torch.Te
     boundary[:, :-1, :] = boundary[:, :-1, :].masked_fill(diff_v, 1.0)
 
     return boundary.unsqueeze(1)  # [B, 1, H, W]
+
+
+class Stage1SegLoss(nn.Module):
+    """CE + Dice + Focal for backbone coarse segmentation training."""
+    def __init__(self, num_classes=7, ignore_index=255, ce_weight=1.0, dice_weight=1.0, focal_weight=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.focal_loss = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=ignore_index)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+        focal = self.focal_loss(logits, targets)
+
+        probs = F.softmax(logits.float(), dim=1)
+        valid_mask = (targets != self.ignore_index).unsqueeze(1)
+        targets_safe = torch.where(targets == self.ignore_index, torch.zeros_like(targets), targets)
+        onehot = F.one_hot(targets_safe, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        probs = probs * valid_mask
+        onehot = onehot * valid_mask
+        inter = torch.sum(probs * onehot, dim=(2, 3))
+        card = torch.sum(probs + onehot, dim=(2, 3))
+        dice = 1.0 - ((2.0 * inter + 1e-5) / (card + 1e-5)).mean()
+        return self.ce_weight * ce + self.dice_weight * dice + self.focal_weight * focal
+
+
+def build_diffusion_schedule(total_steps: int, device: torch.device):
+    betas = torch.linspace(1e-4, 2e-2, total_steps, device=device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    return {
+        "T": total_steps,
+        "sqrt_alphas_cumprod": torch.sqrt(alphas_cumprod),
+        "sqrt_one_minus_alphas_cumprod": torch.sqrt(1.0 - alphas_cumprod),
+    }
+
+
+def sample_timesteps(batch_size: int, total_steps: int, device: torch.device):
+    return torch.randint(0, total_steps, (batch_size,), device=device)
+
+
+def add_mask_noise(gt_mask: torch.Tensor, t: torch.Tensor, schedule: Dict[str, torch.Tensor]):
+    noise = torch.randn_like(gt_mask)
+    s_alpha = schedule["sqrt_alphas_cumprod"][t.long()].view(gt_mask.shape[0], 1, 1, 1)
+    s_noise = schedule["sqrt_one_minus_alphas_cumprod"][t.long()].view(gt_mask.shape[0], 1, 1, 1)
+    noisy_mask = s_alpha * gt_mask + s_noise * noise
+    return noisy_mask, noise
 
 
 # ====================== 改进的数据集类 ======================
@@ -207,11 +251,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default="/workspace/MAF")
     parser.add_argument("--sam3_ckpt", type=str, default="/workspace/sam3/sam3.pt")
+    parser.add_argument("--init_weights", type=str, default="", help="Optional checkpoint to resume stage training")
     parser.add_argument("--save_dir", type=str, default="/workspace/weights/SAM3UNetDiffusion2")
     parser.add_argument("--image_size", type=int, default=336)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--train_stage", type=str, default="stage1", choices=["stage1", "stage2"])
+    parser.add_argument("--diffusion_steps", type=int, default=1000)
     parser.add_argument("--maf_config", type=str, default="/workspace/MAF_Seg/config/maf_fujian.py")
     args = parser.parse_args()
 
@@ -227,24 +274,36 @@ def main():
                             batch_size=2, shuffle=False, num_workers=4)
 
     model = SAM3UNetCNNDifussion(checkpoint_path=args.sam3_ckpt, img_size=args.image_size, num_classes=7).to(device)
+    if args.init_weights:
+        ckpt = torch.load(args.init_weights, map_location=device)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        model.load_state_dict(ckpt, strict=False)
+        print(f"Loaded initial weights from {args.init_weights}")
+
+    model.configure_training_stage(args.train_stage)
+    print(f"Training stage: {args.train_stage}")
 
     # 分层学习率分配
     params = []
     for n, p in model.named_parameters():
         if not p.requires_grad: continue
         lr = args.lr
-        if "sam3_vit" in n: lr *= 0.1
-        elif "eba" in n: lr *= 2.0
-        elif "diffusion_head" in n: lr *= 1.5
-        elif "boundary_head" in n: lr *= 1.5
+        if args.train_stage == "stage1":
+            if "sam3_vit" in n: lr *= 0.1
+            elif "eba" in n: lr *= 2.0
+        else:
+            if "diffusion_head" in n or "boundary_head" in n: lr *= 1.5
         params.append({"params": [p], "lr": lr})
 
     optimizer = torch.optim.AdamW(params, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    # 初始化改进后的损失函数
-    criterion = DiffusionLoss(ignore_index=255).to(device)
-    scaler = torch.cuda.amp.GradScaler()
+
+    stage1_criterion = Stage1SegLoss(num_classes=7, ignore_index=255).to(device)
+    stage2_criterion = nn.MSELoss().to(device)
+    diffusion_schedule = build_diffusion_schedule(args.diffusion_steps, device) if args.train_stage == "stage2" else None
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_miou = -1.0
     history = {"epoch": [], "loss": [], "miou": [], "fwiou":[], "acc":[]}
@@ -258,40 +317,25 @@ def main():
             imgs, masks = imgs.to(device), masks.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                B = imgs.shape[0]
-
-                # 1. 构造 7 通道的 GT One-Hot 掩码 [B, 7, H, W]
-                # 处理 255 标签，防止 one_hot 越界
-                target_for_onehot = masks.clone()
-                target_for_onehot[target_for_onehot == 255] = 0
-
-                # 生成 one_hot 并转为 [B, 7, H, W]，归一化到 [-1, 1]
-                gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
-                gt_mask = gt_mask * 2.0 - 1.0
-
-                # 2. 提取 4-邻域边界 GT [B, 1, H, W]
-                boundary_gt = compute_boundary_gt(masks, ignore_index=255).to(device)
-
-                # 3. 时间步
-                t = torch.randint(0, T, (B,), device=device).float()
-
-                # 4. 扩散加噪 (7通道噪声)
-                noise = torch.randn_like(gt_mask)
-                s_alpha = sqrt_alphas_cumprod[t.long()].view(B, 1, 1, 1)
-                s_noise = sqrt_one_minus_alphas_cumprod[t.long()].view(B, 1, 1, 1)
-                noisy_mask = s_alpha * gt_mask + s_noise * noise
-
-                # 5. 模型前向：返回 (coarse_logits, boundary_logits, noise_pred)
-                coarse_logits, boundary_logits, noise_pred = model(imgs, noisy_mask, t)
-
-                # 6. 计算综合损失
-                loss = criterion(coarse_logits, masks, boundary_logits, boundary_gt, noise_pred, noise)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                if args.train_stage == "stage1":
+                    coarse_logits, _ = model(imgs)
+                    loss = stage1_criterion(coarse_logits, masks)
+                else:
+                    B = imgs.shape[0]
+                    target_for_onehot = masks.clone()
+                    target_for_onehot[target_for_onehot == 255] = 0
+                    gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+                    gt_mask = gt_mask * 2.0 - 1.0
+                    t = sample_timesteps(B, diffusion_schedule["T"], device).float()
+                    noisy_mask, true_noise = add_mask_noise(gt_mask, t, diffusion_schedule)
+                    _, _, noise_pred = model(imgs, noisy_mask, t)
+                    loss = stage2_criterion(noise_pred, true_noise)
 
             # 反向传播
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             scaler.step(optimizer)
             scaler.update()
 
