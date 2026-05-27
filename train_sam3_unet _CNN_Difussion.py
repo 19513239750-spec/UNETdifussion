@@ -139,6 +139,28 @@ class Stage1SegLoss(nn.Module):
                 self.boundary_weight * boundary)
 
 
+class LatentReconstructionLoss(nn.Module):
+    """CE + Dice loss for latent mask reconstruction."""
+    def __init__(self, num_classes=7, ignore_index=255, ce_weight=1.0, dice_weight=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+        probs = F.softmax(logits.float(), dim=1)
+        valid_mask = (targets != self.ignore_index).unsqueeze(1)
+        targets_safe = torch.where(targets == self.ignore_index, torch.zeros_like(targets), targets)
+        onehot = F.one_hot(targets_safe, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        probs = probs * valid_mask
+        onehot = onehot * valid_mask
+        inter = torch.sum(probs * onehot, dim=(2, 3))
+        card = torch.sum(probs + onehot, dim=(2, 3))
+        dice = 1.0 - ((2.0 * inter + 1e-5) / (card + 1e-5)).mean()
+        return (self.ce_weight * ce + self.dice_weight * dice)
+
 def build_diffusion_schedule(total_steps: int, device: torch.device):
     betas = torch.linspace(1e-4, 2e-2, total_steps, device=device)
     alphas = 1.0 - betas
@@ -262,9 +284,47 @@ def plot_curves(epochs, losses, mious, fwious, accs, save_path):
     for ax in axes: ax.grid(True)
     plt.tight_layout()
     plt.savefig(save_path); plt.close()
+
+
+def _extract_vae_state(model: nn.Module) -> Dict[str, torch.Tensor]:
+    state = model.state_dict()
+    prefixes = ("mask_embed.", "mask_encoder.", "mask_decoder.", "image_encoder.")
+    return {k: v for k, v in state.items() if k.startswith(prefixes)}
+
+
+@torch.no_grad()
+def evaluate_reconstruction(model: nn.Module, loader: DataLoader, device: torch.device,
+                            num_classes: int, loss_fn: nn.Module) -> Dict[str, float]:
+    model.eval()
+    conf = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    total_loss = 0.0
+    batches = 0
+    for imgs, masks in loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        target_for_onehot = masks.clone()
+        target_for_onehot[target_for_onehot == 255] = 0
+        gt_mask = F.one_hot(target_for_onehot, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
+        recon_logits = model.decode_mask_latent(gt_latent)
+        loss = loss_fn(recon_logits, masks)
+        total_loss += loss.item()
+        batches += 1
+        pred = recon_logits.argmax(dim=1)
+        valid = masks != 255
+        idx = masks[valid] * num_classes + pred[valid]
+        conf += torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+    iou = conf.diag() / (conf.sum(1) + conf.sum(0) - conf.diag() + 1e-6)
+    miou = float(iou.mean().item())
+    freq = conf.sum(1) / (conf.sum() + 1e-6)
+    fwiou = float((freq * iou).sum().item())
+    pixel_acc = float((conf.diag().sum() / (conf.sum() + 1e-6)).item())
+    avg_loss = total_loss / max(batches, 1)
+    return {"loss": avg_loss, "mIoU": miou, "FWIoU": fwiou, "pixel_acc": pixel_acc}
 # ====================== 主训练函数 ======================
 def main():
     parser = argparse.ArgumentParser()
+    # stage0: pretrain latent mask modules with reconstruction loss
     # stage1: train backbone coarse segmentation with CE + Dice + Focal
     # stage2: freeze backbone and train conditional diffusion refinement with noise MSE
     parser.add_argument("--data_root", type=str, default="/workspace/MAF")
@@ -275,7 +335,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--train_stage", type=str, default="stage1", choices=["stage1", "stage2"])
+    parser.add_argument("--train_stage", type=str, default="stage1", choices=["stage0", "stage1", "stage2"])
+    parser.add_argument("--vae_checkpoint", type=str, default="", help="Optional latent pretrain checkpoint")
+    parser.add_argument("--stage0_train_image_encoder", action="store_true",
+                        help="Also train image_encoder to align with mask latent during stage0")
+    parser.add_argument("--stage0_image_latent_weight", type=float, default=0.1)
+    parser.add_argument("--stage2_freeze_latent_epochs", type=int, default=0)
+    parser.add_argument("--stage2_latent_lr_scale", type=float, default=0.5)
+    parser.add_argument("--stage2_recon_weight", type=float, default=0.1)
     parser.add_argument("--diffusion_steps", type=int, default=1000)
     parser.add_argument("--maf_config", type=str, default="/workspace/MAF_Seg/config/maf_fujian.py")
     args = parser.parse_args()
@@ -291,7 +358,10 @@ def main():
     val_loader = DataLoader(MAFSegDataset(args.data_root, "test", args.image_size, label_mapping=gt_map), 
                             batch_size=2, shuffle=False, num_workers=4)
 
-    model = SAM3UNetCNNDifussion(checkpoint_path=args.sam3_ckpt, img_size=args.image_size, num_classes=7).to(device)
+    model = SAM3UNetCNNDifussion(checkpoint_path=args.sam3_ckpt, img_size=args.image_size, num_classes=7,
+                                 vae_checkpoint=args.vae_checkpoint or None).to(device)
+    if args.train_stage == "stage2" and not args.init_weights:
+        raise ValueError("Stage2 requires --init_weights from the best stage1 checkpoint.")
     if args.init_weights:
         ckpt = torch.load(args.init_weights, map_location=device)
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -299,25 +369,34 @@ def main():
         model.load_state_dict(ckpt, strict=False)
         print(f"Loaded initial weights from {args.init_weights}")
 
-    model.configure_training_stage(args.train_stage)
+    model.configure_training_stage(args.train_stage, train_image_encoder=args.stage0_train_image_encoder)
     print(f"Training stage: {args.train_stage}")
 
     # 分层学习率分配
     params = []
+    stage2_prefixes = ("diffusion_head.", "mask_embed.", "image_encoder.", "mask_encoder.", "mask_decoder.")
     for n, p in model.named_parameters():
-        if not p.requires_grad: continue
+        if args.train_stage == "stage2":
+            if not n.startswith(stage2_prefixes):
+                continue
+        elif not p.requires_grad:
+            continue
         lr = args.lr
         if args.train_stage == "stage1":
             if "sam3_vit" in n: lr *= 0.1
             elif "eba" in n: lr *= 2.0
-        else:
-            if "diffusion_head" in n or "boundary_head" in n: lr *= 1.5
+        elif args.train_stage == "stage2":
+            if n.startswith(("mask_embed.", "image_encoder.", "mask_encoder.", "mask_decoder.")):
+                lr *= args.stage2_latent_lr_scale
+            elif "diffusion_head" in n:
+                lr *= 1.5
         params.append({"params": [p], "lr": lr})
 
     optimizer = torch.optim.AdamW(params, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     stage1_criterion = Stage1SegLoss(num_classes=7, ignore_index=255).to(device)
+    latent_criterion = LatentReconstructionLoss(num_classes=7, ignore_index=255).to(device)
     stage2_criterion = DiffusionLoss(focal_weight=0.0, dice_weight=0.0,
                                      boundary_weight=0.0, diffusion_weight=1.0,
                                      repa_weight=0.5).to(device)
@@ -330,6 +409,10 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if args.train_stage == "stage2" and args.stage2_freeze_latent_epochs > 0:
+            freeze_latent = epoch <= args.stage2_freeze_latent_epochs
+            for module in [model.mask_embed, model.mask_encoder, model.mask_decoder, model.image_encoder]:
+                model._set_module_requires_grad(module, not freeze_latent)
         running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
@@ -338,7 +421,18 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                if args.train_stage == "stage1":
+                if args.train_stage == "stage0":
+                    target_for_onehot = masks.clone()
+                    target_for_onehot[target_for_onehot == 255] = 0
+                    gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+                    gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
+                    recon_logits = model.decode_mask_latent(gt_latent)
+                    loss = latent_criterion(recon_logits, masks)
+                    if args.stage0_train_image_encoder:
+                        image_latent = model.encode_image_latent(imgs)
+                        image_latent = F.interpolate(image_latent, size=gt_latent.shape[2:], mode="bilinear", align_corners=False)
+                        loss = loss + args.stage0_image_latent_weight * F.mse_loss(image_latent, gt_latent.detach())
+                elif args.train_stage == "stage1":
                     coarse_logits, boundary_logits = model(imgs)
                     boundary_gt = compute_boundary_gt(masks, ignore_index=255).to(device)
                     loss = stage1_criterion(coarse_logits, masks, boundary_logits, boundary_gt)
@@ -361,6 +455,15 @@ def main():
                                             true_noise=true_noise,
                                             repa_feat=repa_feat,
                                             teacher_feat=teacher_feat)
+                    if args.stage2_recon_weight > 0:
+                        s_alpha = diffusion_schedule["sqrt_alphas_cumprod"][t.long()].view(B, 1, 1, 1)
+                        s_noise = diffusion_schedule["sqrt_one_minus_alphas_cumprod"][t.long()].view(B, 1, 1, 1)
+                        noise_pred_resized = noise_pred
+                        if noise_pred_resized.shape != noisy_latent.shape:
+                            noise_pred_resized = F.interpolate(noise_pred_resized, size=noisy_latent.shape[2:], mode="bilinear", align_corners=False)
+                        pred_latent = (noisy_latent - s_noise * noise_pred_resized) / (s_alpha + 1e-8)
+                        recon_logits = model.decode_mask_latent(pred_latent)
+                        loss = loss + args.stage2_recon_weight * latent_criterion(recon_logits, masks)
 
             # 反向传播
             scaler.scale(loss).backward()
@@ -373,8 +476,13 @@ def main():
             pbar.set_postfix(loss=f"{running_loss/(pbar.n+1):.4f}")
 
         # 评估与记录
-        metrics = evaluate(model, val_loader, device, 7)
-        avg_loss = running_loss / len(train_loader)
+        if args.train_stage == "stage0":
+            metrics = evaluate_reconstruction(model, val_loader, device, 7, latent_criterion)
+            avg_loss = running_loss / len(train_loader)
+            val_loss = metrics["loss"]
+        else:
+            metrics = evaluate(model, val_loader, device, 7)
+            avg_loss = running_loss / len(train_loader)
         scheduler.step()
 
         history["epoch"].append(epoch)
@@ -387,10 +495,15 @@ def main():
         if metrics["mIoU"] > best_miou:
             best_miou = metrics["mIoU"]
             torch.save(model.state_dict(), save_dir / "best.pt")
+            if args.train_stage == "stage0":
+                torch.save(_extract_vae_state(model), save_dir / "vae_pretrain.pt")
             print(f"新最佳模型已保存: mIoU = {best_miou:.4f}, FWIoU = {metrics['FWIoU']:.4f}")
 
         plot_curves(history["epoch"], history["loss"], history["miou"], history["fwiou"], history["acc"], save_dir / "curves.png")
-        print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
+        if args.train_stage == "stage0":
+            print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | ValLoss: {val_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
+        else:
+            print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
 
     # 训练结束后保存一次
         torch.save(model.state_dict(), save_dir / "final_model.pt")

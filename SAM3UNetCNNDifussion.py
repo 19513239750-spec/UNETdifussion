@@ -773,12 +773,16 @@ class SAM3UNetCNNDifussion(nn.Module):
                 vae_state = vae_state["state_dict"]
             image_state = {k.replace("image_encoder.", ""): v for k, v in vae_state.items()
                            if k.startswith("image_encoder.")}
+            mask_embed_state = {k.replace("mask_embed.", ""): v for k, v in vae_state.items()
+                                if k.startswith("mask_embed.")}
             mask_state = {k.replace("mask_encoder.", ""): v for k, v in vae_state.items()
                           if k.startswith("mask_encoder.")}
             decoder_state = {k.replace("mask_decoder.", ""): v for k, v in vae_state.items()
                              if k.startswith("mask_decoder.")}
             if image_state:
                 self.image_encoder.load_state_dict(image_state, strict=False)
+            if mask_embed_state:
+                self.mask_embed.load_state_dict(mask_embed_state, strict=False)
             if mask_state:
                 self.mask_encoder.load_state_dict(mask_state, strict=False)
             if decoder_state:
@@ -818,6 +822,7 @@ class SAM3UNetCNNDifussion(nn.Module):
         self.eba_4 = EBAModule(channels=128)
         self._default_requires_grad = {n: p.requires_grad for n, p in self.named_parameters()}
         self._train_stage = "stage1"
+        self._stage0_train_image_encoder = False
 
     def _set_module_requires_grad(self, module: nn.Module, requires_grad: bool):
         for p in module.parameters():
@@ -839,18 +844,32 @@ class SAM3UNetCNNDifussion(nn.Module):
     def _diffusion_modules(self):
         return [self.mask_embed, self.image_encoder, self.mask_encoder, self.mask_decoder, self.diffusion_head]
 
-    def configure_training_stage(self, stage: str = "stage1"):
+    def _latent_modules(self):
+        modules = [self.mask_embed, self.mask_encoder, self.mask_decoder]
+        if self._stage0_train_image_encoder:
+            modules.append(self.image_encoder)
+        return modules
+
+    def configure_training_stage(self, stage: str = "stage1", train_image_encoder: bool = False):
         """
+        stage0: train latent mask modules for reconstruction (optional image encoder alignment).
         stage1: train backbone (coarse segmentation) only.
         stage2: freeze backbone and train diffusion refinement only.
         """
-        if stage not in {"stage1", "stage2"}:
+        if stage not in {"stage0", "stage1", "stage2"}:
             raise ValueError(f"Unsupported training stage: {stage}")
         self._train_stage = stage
+        self._stage0_train_image_encoder = train_image_encoder
 
         diffusion_prefixes = ("diffusion_head.", "mask_embed.", "image_encoder.",
                               "mask_encoder.", "mask_decoder.")
-        if stage == "stage1":
+        if stage == "stage0":
+            for n, p in self.named_parameters():
+                should_train = n.startswith(("mask_embed.", "mask_encoder.", "mask_decoder."))
+                if train_image_encoder:
+                    should_train = should_train or n.startswith("image_encoder.")
+                p.requires_grad = should_train
+        elif stage == "stage1":
             for n, p in self.named_parameters():
                 p.requires_grad = self._default_requires_grad.get(n, True)
                 if n.startswith(diffusion_prefixes):
@@ -866,6 +885,10 @@ class SAM3UNetCNNDifussion(nn.Module):
         if mode and self._train_stage == "stage1":
             for m in self._diffusion_modules():
                 m.eval()
+        if mode and self._train_stage == "stage0":
+            for m in self._backbone_modules():
+                m.eval()
+            self.diffusion_head.eval()
         if mode and self._train_stage == "stage2":
             for m in self._backbone_modules():
                 m.eval()
