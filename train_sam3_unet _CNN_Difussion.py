@@ -7,7 +7,7 @@ import importlib.util
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -99,17 +99,22 @@ def compute_boundary_gt(mask: torch.Tensor, ignore_index: int = 255) -> torch.Te
 
 
 class Stage1SegLoss(nn.Module):
-    """CE + Dice + Focal for backbone coarse segmentation training."""
-    def __init__(self, num_classes=7, ignore_index=255, ce_weight=1.0, dice_weight=1.0, focal_weight=1.0):
+    """CE + Dice + Focal for coarse segmentation with optional boundary BCE supervision."""
+    def __init__(self, num_classes=7, ignore_index=255, ce_weight=1.0, dice_weight=1.0,
+                 focal_weight=1.0, boundary_weight=1.0):
         super().__init__()
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.ce_weight = ce_weight
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight
+        self.boundary_weight = boundary_weight
         self.focal_loss = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=ignore_index)
+        self.boundary_loss = nn.BCEWithLogitsLoss()
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor,
+                boundary_logits: Optional[torch.Tensor] = None,
+                boundary_gt: Optional[torch.Tensor] = None) -> torch.Tensor:
         ce = F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
         focal = self.focal_loss(logits, targets)
 
@@ -122,7 +127,16 @@ class Stage1SegLoss(nn.Module):
         inter = torch.sum(probs * onehot, dim=(2, 3))
         card = torch.sum(probs + onehot, dim=(2, 3))
         dice = 1.0 - ((2.0 * inter + 1e-5) / (card + 1e-5)).mean()
-        return self.ce_weight * ce + self.dice_weight * dice + self.focal_weight * focal
+        boundary = torch.tensor(0.0, device=logits.device)
+        if boundary_logits is not None and boundary_gt is not None:
+            bl = boundary_logits
+            if bl.shape != boundary_gt.shape:
+                bl = F.interpolate(bl, size=boundary_gt.shape[2:], mode="bilinear", align_corners=False)
+            boundary = self.boundary_loss(bl, boundary_gt.float())
+        return (self.ce_weight * ce +
+                self.dice_weight * dice +
+                self.focal_weight * focal +
+                self.boundary_weight * boundary)
 
 
 def build_diffusion_schedule(total_steps: int, device: torch.device):
@@ -321,17 +335,18 @@ def main():
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 if args.train_stage == "stage1":
-                    coarse_logits, _ = model(imgs)
-                    loss = stage1_criterion(coarse_logits, masks)
+                    coarse_logits, boundary_logits = model(imgs)
+                    boundary_gt = compute_boundary_gt(masks, ignore_index=255).to(device)
+                    loss = stage1_criterion(coarse_logits, masks, boundary_logits, boundary_gt)
                 else:
                     B = imgs.shape[0]
                     target_for_onehot = masks.clone()
                     target_for_onehot[target_for_onehot == 255] = 0
                     gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
-                    gt_mask = gt_mask * 2.0 - 1.0
                     t = sample_timesteps(B, diffusion_schedule["T"], device).float()
-                    noisy_mask, true_noise = add_mask_noise(gt_mask, t, diffusion_schedule)
-                    _, _, noise_pred = model(imgs, noisy_mask, t)
+                    gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
+                    noisy_latent, true_noise = add_mask_noise(gt_latent, t, diffusion_schedule)
+                    _, _, noise_pred = model(imgs, noisy_latent, t)
                     loss = stage2_criterion(noise_pred, true_noise)
 
             # 反向传播
