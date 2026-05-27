@@ -151,7 +151,9 @@ def build_diffusion_schedule(total_steps: int, device: torch.device):
 
 
 def sample_timesteps(batch_size: int, total_steps: int, device: torch.device):
-    return torch.randint(0, total_steps, (batch_size,), device=device)
+    r = torch.rand((batch_size,), device=device)
+    t = (1 - r ** 3) * (total_steps - 1)
+    return t.long()
 
 
 def add_mask_noise(gt_mask: torch.Tensor, t: torch.Tensor, schedule: Dict[str, torch.Tensor]):

@@ -429,17 +429,15 @@ class LatentDecoder(nn.Module):
         return self.net(x)
 
 class MaskDiffusionHead(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=128):
+    def __init__(self, latent_channels=4, hidden_dim=128, num_heads=8):
         super().__init__()
-        # Conditioning: t(1) + image latent + coarse latent + boundary map (1)
-        cond_dim = 1 + latent_channels + latent_channels + 1
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        cond_channels = latent_channels + latent_channels + 1
         self.mask_in = nn.Conv2d(latent_channels, hidden_dim, kernel_size=3, padding=1)
-        self.res_block = AdaGN_ResidualBlock(hidden_dim, hidden_dim)
+        self.guidance_in = nn.Conv2d(cond_channels, hidden_dim, kernel_size=1)
+        self.zero_conv = nn.Conv2d(hidden_dim + cond_channels, hidden_dim, kernel_size=1)
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
         self.out_conv = nn.Conv2d(hidden_dim, latent_channels, kernel_size=1)
 
     def forward(self, x_t, t, image_latent, coarse_latent, boundary_logits):
@@ -450,16 +448,20 @@ class MaskDiffusionHead(nn.Module):
         coarse_latent:  [B, latent_channels, H, W]  coarse mask latent condition
         boundary_logits:[B, 1, H, W]             boundary prior
         """
-        image_global = F.adaptive_avg_pool2d(image_latent, 1).flatten(1)
-        coarse_global = F.adaptive_avg_pool2d(coarse_latent, 1).flatten(1)
-        boundary_global = F.adaptive_avg_pool2d(boundary_logits, 1).flatten(1)
-        t_input = torch.cat(
-            [t.view(-1, 1).to(x_t.dtype), image_global, coarse_global, boundary_global], dim=1
-        )
-        c_emb = self.cond_mlp(t_input)
-        x = self.mask_in(x_t)
-        x = self.res_block(x, c_emb)
-        return self.out_conv(x)
+        f_z_t = self.mask_in(x_t)
+        guidance = torch.cat([image_latent, coarse_latent, boundary_logits], dim=1)
+        local_input = torch.cat([f_z_t, guidance], dim=1)
+        f_prime = self.zero_conv(local_input)
+
+        guidance_proj = self.guidance_in(guidance)
+        bsz, ch, h, w = f_prime.shape
+        query = f_prime.flatten(2).transpose(1, 2)
+        key = guidance_proj.flatten(2).transpose(1, 2)
+        attn_out, _ = self.cross_attn(query, key, key)
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, ch, h, w)
+
+        out = f_prime + attn_out
+        return self.out_conv(out)
 
 
 class BoundaryHead(nn.Module):
