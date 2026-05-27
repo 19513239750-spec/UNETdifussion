@@ -321,6 +321,60 @@ def evaluate_reconstruction(model: nn.Module, loader: DataLoader, device: torch.
     pixel_acc = float((conf.diag().sum() / (conf.sum() + 1e-6)).item())
     avg_loss = total_loss / max(batches, 1)
     return {"loss": avg_loss, "mIoU": miou, "FWIoU": fwiou, "pixel_acc": pixel_acc}
+
+
+def evaluate_stage0(model: nn.Module, loader: DataLoader, device: torch.device,
+                    num_classes: int, loss_fn: nn.Module) -> Dict[str, float]:
+    return evaluate_reconstruction(model, loader, device, num_classes, loss_fn)
+
+
+def evaluate_stage1(model: nn.Module, loader: DataLoader, device: torch.device,
+                    num_classes: int) -> Dict[str, float]:
+    return evaluate(model, loader, device, num_classes)
+
+
+@torch.no_grad()
+def evaluate_stage2(model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int,
+                    t_start: int = 200, num_steps: int = 5, T: int = 1000,
+                    betas: torch.Tensor | None = None) -> Dict[str, float]:
+    model.eval()
+    conf_coarse = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    conf_refined = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    if betas is None:
+        betas = torch.linspace(1e-4, 2e-2, T, device=device)
+    else:
+        betas = betas.to(device)
+
+    def _metrics(conf: torch.Tensor) -> Dict[str, float]:
+        iou = conf.diag() / (conf.sum(1) + conf.sum(0) - conf.diag() + 1e-6)
+        miou = float(iou.mean().item())
+        freq = conf.sum(1) / (conf.sum() + 1e-6)
+        fwiou = float((freq * iou).sum().item())
+        pixel_acc = float((conf.diag().sum() / (conf.sum() + 1e-6)).item())
+        return {"mIoU": miou, "FWIoU": fwiou, "pixel_acc": pixel_acc}
+
+    for imgs, masks in loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        output = model(imgs)
+        coarse_logits = output[0] if isinstance(output, tuple) else output
+        pred_coarse = coarse_logits.argmax(dim=1)
+        refined_logits = model.refine_sample(imgs, t_start=t_start, num_steps=num_steps, T=T, betas=betas)
+        pred_refined = refined_logits.argmax(dim=1)
+
+        valid = masks != 255
+        idx_c = masks[valid] * num_classes + pred_coarse[valid]
+        conf_coarse += torch.bincount(idx_c, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+        idx_r = masks[valid] * num_classes + pred_refined[valid]
+        conf_refined += torch.bincount(idx_r, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+    refined = _metrics(conf_refined)
+    coarse = _metrics(conf_coarse)
+    refined.update({
+        "coarse_mIoU": coarse["mIoU"],
+        "coarse_FWIoU": coarse["FWIoU"],
+        "coarse_pixel_acc": coarse["pixel_acc"],
+    })
+    return refined
 # ====================== 主训练函数 ======================
 def main():
     parser = argparse.ArgumentParser()
@@ -476,13 +530,16 @@ def main():
             pbar.set_postfix(loss=f"{running_loss/(pbar.n+1):.4f}")
 
         # 评估与记录
+        avg_loss = running_loss / len(train_loader)
         if args.train_stage == "stage0":
-            metrics = evaluate_reconstruction(model, val_loader, device, 7, latent_criterion)
-            avg_loss = running_loss / len(train_loader)
+            metrics = evaluate_stage0(model, val_loader, device, 7, latent_criterion)
             val_loss = metrics["loss"]
+        elif args.train_stage == "stage1":
+            metrics = evaluate_stage1(model, val_loader, device, 7)
         else:
-            metrics = evaluate(model, val_loader, device, 7)
-            avg_loss = running_loss / len(train_loader)
+            t_start = min(200, args.diffusion_steps - 1)
+            metrics = evaluate_stage2(model, val_loader, device, 7, t_start=t_start,
+                                      num_steps=5, T=args.diffusion_steps)
         scheduler.step()
 
         history["epoch"].append(epoch)
@@ -502,8 +559,14 @@ def main():
         plot_curves(history["epoch"], history["loss"], history["miou"], history["fwiou"], history["acc"], save_dir / "curves.png")
         if args.train_stage == "stage0":
             print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | ValLoss: {val_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
-        else:
+        elif args.train_stage == "stage1":
             print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
+        else:
+            print(
+                f"Epoch {epoch} | Loss: {avg_loss:.4f} | Refined mIoU: {metrics['mIoU']:.4f} | "
+                f"Refined FWIoU: {metrics['FWIoU']:.4f} | Coarse mIoU: {metrics['coarse_mIoU']:.4f} | "
+                f"Coarse FWIoU: {metrics['coarse_FWIoU']:.4f}"
+            )
 
     # 训练结束后保存一次
         torch.save(model.state_dict(), save_dir / "final_model.pt")
