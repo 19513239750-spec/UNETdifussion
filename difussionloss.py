@@ -30,13 +30,15 @@ class DiffusionLoss(nn.Module):
                  focal_weight=1.0, 
                  dice_weight=1.0, 
                  boundary_weight=1.5, 
-                 diffusion_weight=1.5, 
+                 diffusion_weight=1.5,
+                 repa_weight=0.5,
                  ignore_index=255):
         super().__init__()
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
         self.boundary_weight = boundary_weight
         self.diffusion_weight = diffusion_weight
+        self.repa_weight = repa_weight
         self.ignore_index = ignore_index
         
         self.focal_loss = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=ignore_index)
@@ -49,7 +51,9 @@ class DiffusionLoss(nn.Module):
                 boundary_logits: torch.Tensor = None,
                 boundary_gt: torch.Tensor = None,
                 noise_pred: torch.Tensor = None,
-                true_noise: torch.Tensor = None
+                true_noise: torch.Tensor = None,
+                repa_feat: torch.Tensor = None,
+                teacher_feat: torch.Tensor = None
                 ) -> torch.Tensor:
         """
         Parameters
@@ -97,11 +101,19 @@ class DiffusionLoss(nn.Module):
                 np_ = F.interpolate(np_, size=true_noise.shape[2:], mode='bilinear', align_corners=False)
             loss_diffusion = self.mse_loss(np_, true_noise.float())
 
+        # ── REPA feature alignment loss (cosine) ─────────────────────────────
+        loss_repa = torch.tensor(0.0, device=coarse_logits.device)
+        if repa_feat is not None and teacher_feat is not None:
+            teacher_resized = F.interpolate(teacher_feat.float(), size=repa_feat.shape[2:], mode='bilinear', align_corners=False)
+            cos_sim = F.cosine_similarity(repa_feat.float(), teacher_resized, dim=1)
+            loss_repa = -cos_sim.mean()
+
         # ── Total loss ────────────────────────────────────────────────────────
         total_loss = (self.focal_weight * loss_focal +
                       self.dice_weight * loss_dice +
                       self.boundary_weight * loss_boundary +
-                      self.diffusion_weight * loss_diffusion)
+                      self.diffusion_weight * loss_diffusion +
+                      self.repa_weight * loss_repa)
 
         return total_loss
 

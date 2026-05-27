@@ -374,38 +374,106 @@ class AdaGN_ResidualBlock(nn.Module):
         x = self.conv2(self.act(x))
         return x + res
 
-class MaskDiffusionHead(nn.Module):
-    def __init__(self, feature_dim=128, hidden_dim=128, num_classes=7):
+class MaskEmbedding(nn.Module):
+    """Embed discrete mask logits/one-hot into continuous features for latent encoding."""
+    def __init__(self, in_channels: int, embed_dim: int = 32):
         super().__init__()
-        # Conditioning: t(1) + visual features(feature_dim) + coarse logits(num_classes) + boundary logit(1)
-        cond_dim = 1 + feature_dim + num_classes + 1
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, hidden_dim),
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, embed_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, embed_dim),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class LatentEncoder(nn.Module):
+    """Lightweight VAE-style encoder (deterministic) for latent diffusion."""
+    def __init__(self, in_channels: int, latent_channels: int = 4, base_channels: int = 64, num_down: int = 2):
+        super().__init__()
+        layers = [nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)]
+        ch = base_channels
+        for _ in range(num_down):
+            layers += [
+                nn.GELU(),
+                nn.Conv2d(ch, ch * 2, kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(8, ch * 2)
+            ]
+            ch *= 2
+        layers += [nn.GELU(), nn.Conv2d(ch, latent_channels, kernel_size=1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class LatentDecoder(nn.Module):
+    """Lightweight decoder to map latent mask features back to logits."""
+    def __init__(self, latent_channels: int = 4, out_channels: int = 7, base_channels: int = 64, num_up: int = 2):
+        super().__init__()
+        ch = base_channels * (2 ** num_up)
+        layers = [nn.Conv2d(latent_channels, ch, kernel_size=1)]
+        for _ in range(num_up):
+            layers += [
+                nn.GELU(),
+                nn.ConvTranspose2d(ch, ch // 2, kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(8, ch // 2)
+            ]
+            ch //= 2
+        layers += [nn.GELU(), nn.Conv2d(ch, out_channels, kernel_size=1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class MaskDiffusionHead(nn.Module):
+    def __init__(self, latent_channels=4, hidden_dim=128, num_heads=8):
+        super().__init__()
+        guidance_channels = latent_channels + latent_channels
+        local_channels = guidance_channels + 1
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        self.mask_in = nn.Conv2d(num_classes, hidden_dim, kernel_size=3, padding=1)
-        self.res_block = AdaGN_ResidualBlock(hidden_dim, hidden_dim)
-        self.out_conv = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+        self.mask_in = nn.Conv2d(latent_channels, hidden_dim, kernel_size=3, padding=1)
+        self.guidance_in = nn.Conv2d(guidance_channels, hidden_dim, kernel_size=1)
+        self.zero_conv = nn.Conv2d(hidden_dim + local_channels, hidden_dim, kernel_size=1)
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
+        self.repa_head = nn.Conv2d(hidden_dim, 128, kernel_size=1)
+        self.out_conv = nn.Conv2d(hidden_dim, latent_channels, kernel_size=1)
 
-    def forward(self, x_t, t, cond_feat, coarse_logits, boundary_logits):
+    def forward(self, x_t, t, image_latent, coarse_latent, boundary_logits):
         """
-        x_t:            [B, num_classes, H, W]  noisy mask at current step
+        x_t:            [B, latent_channels, H, W]  noisy latent mask
         t:              [B]                      diffusion timestep
-        cond_feat:      [B, feature_dim, H, W]  visual features from UNet decoder
-        coarse_logits:  [B, num_classes, H, W]  coarse segmentation prior
+        image_latent:   [B, latent_channels, H, W]  image latent condition
+        coarse_latent:  [B, latent_channels, H, W]  coarse mask latent condition
         boundary_logits:[B, 1, H, W]             boundary prior
         """
-        global_feat = F.adaptive_avg_pool2d(cond_feat, 1).flatten(1)
-        coarse_global = F.adaptive_avg_pool2d(coarse_logits, 1).flatten(1)
-        boundary_global = F.adaptive_avg_pool2d(boundary_logits, 1).flatten(1)
-        t_input = torch.cat(
-            [t.view(-1, 1).to(x_t.dtype), global_feat, coarse_global, boundary_global], dim=1
-        )
-        c_emb = self.cond_mlp(t_input)
-        x = self.mask_in(x_t)
-        x = self.res_block(x, c_emb)
-        return self.out_conv(x)
+        t_embed = self.time_mlp(t.view(-1, 1).to(dtype=x_t.dtype)).unsqueeze(-1).unsqueeze(-1)
+        f_z_t = self.mask_in(x_t) + t_embed
+
+        guidance_kv = torch.cat([image_latent, coarse_latent], dim=1)
+        local_guidance = torch.cat([image_latent, coarse_latent, boundary_logits], dim=1)
+        local_input = torch.cat([f_z_t, local_guidance], dim=1)
+        f_prime = self.zero_conv(local_input)
+
+        guidance_proj = self.guidance_in(guidance_kv)
+        bsz, ch, h, w = f_prime.shape
+        query = f_prime.flatten(2).transpose(1, 2)
+        key = guidance_proj.flatten(2).transpose(1, 2)
+        attn_out, _ = self.cross_attn(query, key, key)
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, ch, h, w)
+
+        fused = f_prime + attn_out
+        noise_pred = self.out_conv(fused)
+        repa_feat = self.repa_head(fused)
+        return noise_pred, repa_feat
 
 
 class BoundaryHead(nn.Module):
@@ -671,12 +739,22 @@ def _create_vit_backbone(img_size):
 
 
 class SAM3UNetCNNDifussion(nn.Module):
-    def __init__(self, checkpoint_path=None, img_size=336, num_classes=7) -> None:
+    def __init__(self, checkpoint_path=None, img_size=336, num_classes=7,
+                 latent_channels: int = 4, latent_embed_dim: int = 32,
+                 latent_base_channels: int = 64, vae_checkpoint=None) -> None:
         super(SAM3UNetCNNDifussion, self).__init__()
         self.num_classes = num_classes
+        self.latent_channels = latent_channels
         self.sam3_vit = _create_vit_backbone(img_size)
         self.cnn_branch = CNNFeatureBranch(in_chans=3, embed_dim=128)
-        self.diffusion_head = MaskDiffusionHead(feature_dim=128, num_classes=num_classes)
+        self.mask_embed = MaskEmbedding(num_classes, embed_dim=latent_embed_dim)
+        self.image_encoder = LatentEncoder(in_channels=3, latent_channels=latent_channels,
+                                           base_channels=latent_base_channels, num_down=2)
+        self.mask_encoder = LatentEncoder(in_channels=latent_embed_dim, latent_channels=latent_channels,
+                                          base_channels=latent_base_channels, num_down=2)
+        self.mask_decoder = LatentDecoder(latent_channels=latent_channels, out_channels=num_classes,
+                                          base_channels=latent_base_channels, num_up=2)
+        self.diffusion_head = MaskDiffusionHead(latent_channels=latent_channels, hidden_dim=128)
         self.boundary_head = BoundaryHead(in_channels=128)
 
 
@@ -689,6 +767,26 @@ class SAM3UNetCNNDifussion(nn.Module):
                 if "detector.backbone.vision_backbone.trunk" in k and 'freqs_cis' not in k:
                     new_ckpt[k[len("detector.backbone.vision_backbone.trunk."):]] = v
             self.sam3_vit.load_state_dict(new_ckpt, strict=False)
+        if vae_checkpoint:
+            vae_state = torch.load(vae_checkpoint, map_location="cpu")
+            if isinstance(vae_state, dict) and "state_dict" in vae_state:
+                vae_state = vae_state["state_dict"]
+            image_state = {k.replace("image_encoder.", ""): v for k, v in vae_state.items()
+                           if k.startswith("image_encoder.")}
+            mask_embed_state = {k.replace("mask_embed.", ""): v for k, v in vae_state.items()
+                                if k.startswith("mask_embed.")}
+            mask_state = {k.replace("mask_encoder.", ""): v for k, v in vae_state.items()
+                          if k.startswith("mask_encoder.")}
+            decoder_state = {k.replace("mask_decoder.", ""): v for k, v in vae_state.items()
+                             if k.startswith("mask_decoder.")}
+            if image_state:
+                self.image_encoder.load_state_dict(image_state, strict=False)
+            if mask_embed_state:
+                self.mask_embed.load_state_dict(mask_embed_state, strict=False)
+            if mask_state:
+                self.mask_encoder.load_state_dict(mask_state, strict=False)
+            if decoder_state:
+                self.mask_decoder.load_state_dict(decoder_state, strict=False)
         for param in self.sam3_vit.parameters():
             param.requires_grad = False
         blocks = []
@@ -722,6 +820,93 @@ class SAM3UNetCNNDifussion(nn.Module):
         self.eba_2 = EBAModule(channels=128)
         self.eba_3 = EBAModule(channels=128)
         self.eba_4 = EBAModule(channels=128)
+        self._default_requires_grad = {n: p.requires_grad for n, p in self.named_parameters()}
+        self._train_stage = "stage1"
+        self._stage0_train_image_encoder = False
+
+    def _set_module_requires_grad(self, module: nn.Module, requires_grad: bool):
+        for p in module.parameters():
+            p.requires_grad = requires_grad
+
+    def _backbone_modules(self):
+        return [
+            self.sam3_vit,
+            self.cnn_branch,
+            self.reduce1, self.reduce2, self.reduce3, self.reduce4,
+            self.up1, self.up2, self.up3, self.up4,
+            self.head,
+            self.wf1, self.wf2, self.wf3,
+            self.gltb1, self.gltb2, self.gltb3, self.gltb4,
+            self.eba_1, self.eba_2, self.eba_3, self.eba_4,
+            self.boundary_head,
+        ]
+
+    def _diffusion_modules(self):
+        return [self.mask_embed, self.image_encoder, self.mask_encoder, self.mask_decoder, self.diffusion_head]
+
+    def _latent_modules(self):
+        modules = [self.mask_embed, self.mask_encoder, self.mask_decoder]
+        if self._stage0_train_image_encoder:
+            modules.append(self.image_encoder)
+        return modules
+
+    def configure_training_stage(self, stage: str = "stage1", train_image_encoder: bool = False):
+        """
+        stage0: train latent mask modules for reconstruction (optional image encoder alignment).
+        stage1: train backbone (coarse segmentation) only.
+        stage2: freeze backbone and train diffusion refinement only.
+        """
+        if stage not in {"stage0", "stage1", "stage2"}:
+            raise ValueError(f"Unsupported training stage: {stage}")
+        self._train_stage = stage
+        self._stage0_train_image_encoder = train_image_encoder
+
+        diffusion_prefixes = ("diffusion_head.", "mask_embed.", "image_encoder.",
+                              "mask_encoder.", "mask_decoder.")
+        if stage == "stage0":
+            for n, p in self.named_parameters():
+                should_train = n.startswith(("mask_embed.", "mask_encoder.", "mask_decoder."))
+                if train_image_encoder:
+                    should_train = should_train or n.startswith("image_encoder.")
+                p.requires_grad = should_train
+        elif stage == "stage1":
+            for n, p in self.named_parameters():
+                p.requires_grad = self._default_requires_grad.get(n, True)
+                if n.startswith(diffusion_prefixes):
+                    p.requires_grad = False
+        else:
+            for n, p in self.named_parameters():
+                p.requires_grad = n.startswith(diffusion_prefixes)
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep frozen submodules in eval mode to avoid BN/running-stat updates.
+        if mode and self._train_stage == "stage1":
+            for m in self._diffusion_modules():
+                m.eval()
+        if mode and self._train_stage == "stage0":
+            for m in self._backbone_modules():
+                m.eval()
+            self.diffusion_head.eval()
+        if mode and self._train_stage == "stage2":
+            for m in self._backbone_modules():
+                m.eval()
+        return self
+
+    def encode_image_latent(self, x: torch.Tensor) -> torch.Tensor:
+        return self.image_encoder(x)
+
+    def encode_mask_latent(self, mask: torch.Tensor, is_logits: bool = True) -> torch.Tensor:
+        if is_logits:
+            mask = F.softmax(mask, dim=1)
+        emb = self.mask_embed(mask)
+        latent = self.mask_encoder(emb)
+        return torch.tanh(latent)
+
+    def decode_mask_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.mask_decoder(latent)
+
     def _extract_features(self, x):
         """Extract visual features, coarse logits, and boundary logits at feature-map resolution."""
         vit_feat = self.sam3_vit(x)[-1]
@@ -759,21 +944,30 @@ class SAM3UNetCNNDifussion(nn.Module):
         boundary_logits = F.interpolate(boundary_feat, size=(H, W), mode='bilinear', align_corners=False)
 
         if mask_t is not None and t is not None:
-            # Resize noisy mask to feature-map resolution for diffusion head
-            mask_t_input = F.interpolate(mask_t, size=visual_features.shape[2:], mode='bilinear', align_corners=False)
-            # Diffusion head conditioned on visual features, coarse prior, and boundary prior
-            noise_pred = self.diffusion_head(mask_t_input, t, visual_features, coarse_feat, boundary_feat)
-            noise_pred = F.interpolate(noise_pred, size=(H, W), mode='bilinear', align_corners=False)
-            return out, boundary_logits, noise_pred
+            image_latent = self.encode_image_latent(x)
+            coarse_latent = self.encode_mask_latent(out.detach(), is_logits=True)
+
+            mask_t_input = mask_t
+            if mask_t_input.shape[1] != self.latent_channels:
+                mask_t_input = self.encode_mask_latent(mask_t_input, is_logits=True)
+            if mask_t_input.shape[2:] != image_latent.shape[2:]:
+                mask_t_input = F.interpolate(mask_t_input, size=image_latent.shape[2:], mode='bilinear', align_corners=False)
+
+            if coarse_latent.shape[2:] != mask_t_input.shape[2:]:
+                coarse_latent = F.interpolate(coarse_latent, size=mask_t_input.shape[2:], mode='bilinear', align_corners=False)
+            if image_latent.shape[2:] != mask_t_input.shape[2:]:
+                image_latent = F.interpolate(image_latent, size=mask_t_input.shape[2:], mode='bilinear', align_corners=False)
+            boundary_cond = F.interpolate(boundary_logits, size=mask_t_input.shape[2:], mode='bilinear', align_corners=False)
+
+            noise_pred, repa_feat = self.diffusion_head(mask_t_input, t, image_latent, coarse_latent, boundary_cond)
+            return out, boundary_logits, noise_pred, repa_feat
 
         return out, boundary_logits
 
     @torch.no_grad()
-    def ddpm_sample(self, x, num_steps=20, T=1000, betas=None):
+    def refine_sample(self, x, t_start: int = 200, num_steps: int = 5, T: int = 1000, betas=None, eta: float = 0.0):
         """
-        DDPM reverse sampling for inference.
-        Caches visual features from the discriminative branch and runs the diffusion
-        head for ``num_steps`` denoising steps to produce a refined mask.
+        DDIM refinement sampling starting from the coarse mask latent with light noise injection.
 
         Returns
         -------
@@ -790,46 +984,51 @@ class SAM3UNetCNNDifussion(nn.Module):
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
-        # ── Step 1: extract features once (discriminative branch) ──────────
+        # ── Step 1: coarse prediction + latent conditions ────────────────
         visual_features, coarse_feat, boundary_feat = self._extract_features(x)
-        feat_h, feat_w = visual_features.shape[2:]
-        dtype = visual_features.dtype
+        coarse_logits = F.interpolate(coarse_feat, size=(H, W), mode='bilinear', align_corners=False)
+        boundary_logits = F.interpolate(boundary_feat, size=(H, W), mode='bilinear', align_corners=False)
 
-        # ── Step 2: initialise from pure noise at feature-map resolution ───
-        xt = torch.randn(B, self.num_classes, feat_h, feat_w, device=device, dtype=dtype)
+        image_latent = self.encode_image_latent(x)
+        coarse_latent = self.encode_mask_latent(coarse_logits, is_logits=True)
+        latent_h, latent_w = coarse_latent.shape[2:]
+        if image_latent.shape[2:] != (latent_h, latent_w):
+            image_latent = F.interpolate(image_latent, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
+        boundary_cond = F.interpolate(boundary_logits, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
 
-        # ── Step 3: uniformly spaced reverse timesteps ─────────────────────
-        step_indices = torch.linspace(T - 1, 0, num_steps, dtype=torch.long)
+        # ── Step 2: inject light noise at t_start ─────────────────────────
+        t_start = int(max(0, min(t_start, T - 1)))
+        alpha_t = alphas_cumprod[t_start]
+        xt = alpha_t.sqrt() * coarse_latent + (1.0 - alpha_t).sqrt() * torch.randn_like(coarse_latent)
 
-        for step in step_indices:
-            step = int(step.item())
+        # ── Step 3: DDIM refinement steps ────────────────────────────────
+        step_indices = torch.linspace(t_start, 0, num_steps, dtype=torch.long, device=device)
+        step_indices = [int(s.item()) for s in step_indices]
+
+        for idx, step in enumerate(step_indices):
             t_tensor = torch.full((B,), step, device=device, dtype=torch.float32)
-
             alpha_t = alphas_cumprod[step]
-            alpha_prev = alphas_cumprod[step - 1] if step > 0 else torch.ones(1, device=device)
-            beta_t = betas[step]
+            prev_step = step_indices[idx + 1] if idx + 1 < len(step_indices) else -1
+            alpha_prev = alphas_cumprod[prev_step] if prev_step >= 0 else torch.ones(1, device=device)
 
-            # Predict noise with diffusion head
-            noise_pred = self.diffusion_head(xt, t_tensor, visual_features, coarse_feat, boundary_feat)
+            noise_pred, _ = self.diffusion_head(xt, t_tensor, image_latent, coarse_latent, boundary_cond)
 
-            # Predict x_0 from current x_t
             x0_pred = (xt - (1.0 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-1.0, 1.0)
 
-            # Posterior mean (DDPM reverse step)
-            denom = (1.0 - alpha_t).clamp(min=1e-8)
-            coef1 = alpha_prev.sqrt() * beta_t / denom
-            coef2 = alphas[step].sqrt() * (1.0 - alpha_prev) / denom
-            mean = coef1 * x0_pred + coef2 * xt
+            sigma = eta * ((1 - alpha_prev) / (1 - alpha_t)).sqrt() * (1 - alpha_t / alpha_prev).sqrt()
+            dir_coeff = (1 - alpha_prev - sigma ** 2).clamp(min=0).sqrt()
+            dir_xt = dir_coeff * noise_pred
+            xt = alpha_prev.sqrt() * x0_pred + dir_xt
+            if prev_step >= 0 and eta > 0:
+                xt = xt + sigma * torch.randn_like(xt)
 
-            if step > 0:
-                var = (beta_t * (1.0 - alpha_prev) / denom).clamp(min=0)
-                xt = mean + var.sqrt() * torch.randn_like(xt)
-            else:
-                xt = mean
+        # ── Step 4: decode latent mask and upsample to original resolution ─
+        refined_logits = self.decode_mask_latent(xt)
+        return F.interpolate(refined_logits, size=(H, W), mode='bilinear', align_corners=False)
 
-        # ── Step 4: upsample refined mask to original resolution ───────────
-        return F.interpolate(xt, size=(H, W), mode='bilinear', align_corners=False)
+    def ddpm_sample(self, x, num_steps=20, T=1000, betas=None, eta: float = 0.0):
+        return self.refine_sample(x, t_start=T - 1, num_steps=num_steps, T=T, betas=betas, eta=eta)
 
     
 
@@ -840,4 +1039,3 @@ class SAM3UNetCNNDifussion(nn.Module):
 #         x = torch.randn(1, 3, 336, 336).cuda()
 #         out = model(x)
 #         print(out.shape)
-
