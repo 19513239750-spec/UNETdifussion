@@ -344,6 +344,7 @@ def main():
                     target_for_onehot[target_for_onehot == 255] = 0
                     gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
                     t = sample_timesteps(B, diffusion_schedule["T"], device).float()
+                    # Latent diffusion: encode GT mask into latent space before noising.
                     gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
                     noisy_latent, true_noise = add_mask_noise(gt_latent, t, diffusion_schedule)
                     _, _, noise_pred = model(imgs, noisy_latent, t)
