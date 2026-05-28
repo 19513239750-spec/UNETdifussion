@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ast
+import importlib.util
+import json
+import random
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from sam3_unet.loss.difussionloss import FocalLoss, DiffusionLoss
+
+
+# ====================== 绘图库 ======================
+import matplotlib.pyplot as plt
+plt.rcParams["figure.figsize"] = (10, 8)
+
+
+def _load_sam3_unet_cnn_cls():
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "SAM3UNetCNNDifussionv3.py",
+        script_dir / "sam3_unet" / "sam3" / "SAM3UNetCNNDifussionv3.py",
+    ]
+    for p in candidates:
+        if p.exists():
+            spec = importlib.util.spec_from_file_location("SAM3UNetCNNDifussionv3", str(p))
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod.SAM3UNetCNNDifussionv3
+    raise ModuleNotFoundError("Cannot find SAM3UNetCNNDifussionv3.py")
+
+SAM3UNetCNNDifussionv3 = _load_sam3_unet_cnn_cls()
+
+def load_maf_fujian_meta(config_path: str) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    p = Path(config_path)
+    if not p.exists(): return out
+    src = p.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    wanted = {"GT_LABEL_MAPPING", "CLASS_COLORS", "CLASSES"}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id in wanted:
+                    try: out[t.id] = ast.literal_eval(node.value)
+                    except: pass
+    return out
+
+
+def compute_boundary_gt(mask: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
+    """
+    Compute 4-neighbour boundary ground truth from a semantic mask.
+
+    Parameters
+    ----------
+    mask : torch.Tensor  [B, H, W]  long tensor with class labels 0..6 and ignore_index
+    ignore_index : int   pixels with this value are excluded from boundary detection
+
+    Returns
+    -------
+    torch.Tensor  [B, 1, H, W]  float, 1 at boundary pixels, 0 elsewhere
+    """
+    valid = (mask != ignore_index)
+    # Replace ignored pixels with -1 so they don't trigger false boundaries
+    m = mask.clone()
+    m[~valid] = -1
+
+    boundary = torch.zeros_like(m, dtype=torch.float32)
+
+    # Horizontal neighbours
+    diff_h = (m[:, :, 1:] != m[:, :, :-1]) & valid[:, :, 1:] & valid[:, :, :-1]
+    boundary[:, :, 1:]  = boundary[:, :, 1:].masked_fill(diff_h, 1.0)
+    boundary[:, :, :-1] = boundary[:, :, :-1].masked_fill(diff_h, 1.0)
+
+    # Vertical neighbours
+    diff_v = (m[:, 1:, :] != m[:, :-1, :]) & valid[:, 1:, :] & valid[:, :-1, :]
+    boundary[:, 1:, :]  = boundary[:, 1:, :].masked_fill(diff_v, 1.0)
+    boundary[:, :-1, :] = boundary[:, :-1, :].masked_fill(diff_v, 1.0)
+
+    return boundary.unsqueeze(1)  # [B, 1, H, W]
+
+
+class Stage1SegLoss(nn.Module):
+    """CE + Dice + Focal for coarse segmentation with optional boundary BCE supervision."""
+    def __init__(self, num_classes=7, ignore_index=255, ce_weight=1.0, dice_weight=1.0,
+                 focal_weight=1.0, boundary_weight=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.boundary_weight = boundary_weight
+        self.focal_loss = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=ignore_index)
+        self.boundary_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor,
+                boundary_logits: Optional[torch.Tensor] = None,
+                boundary_gt: Optional[torch.Tensor] = None) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+        focal = self.focal_loss(logits, targets)
+
+        probs = F.softmax(logits.float(), dim=1)
+        valid_mask = (targets != self.ignore_index).unsqueeze(1)
+        targets_safe = torch.where(targets == self.ignore_index, torch.zeros_like(targets), targets)
+        onehot = F.one_hot(targets_safe, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        probs = probs * valid_mask
+        onehot = onehot * valid_mask
+        inter = torch.sum(probs * onehot, dim=(2, 3))
+        card = torch.sum(probs + onehot, dim=(2, 3))
+        dice = 1.0 - ((2.0 * inter + 1e-5) / (card + 1e-5)).mean()
+        boundary = torch.tensor(0.0, device=logits.device)
+        if boundary_logits is not None and boundary_gt is not None:
+            bl = boundary_logits
+            if bl.shape != boundary_gt.shape:
+                bl = F.interpolate(bl, size=boundary_gt.shape[2:], mode="bilinear", align_corners=False)
+            boundary = self.boundary_loss(bl, boundary_gt.float())
+        return (self.ce_weight * ce +
+                self.dice_weight * dice +
+                self.focal_weight * focal +
+                self.boundary_weight * boundary)
+
+
+class LatentReconstructionLoss(nn.Module):
+    """CE + Dice loss for latent mask reconstruction."""
+    def __init__(self, num_classes=7, ignore_index=255, ce_weight=1.0, dice_weight=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+        probs = F.softmax(logits.float(), dim=1)
+        valid_mask = (targets != self.ignore_index).unsqueeze(1)
+        targets_safe = torch.where(targets == self.ignore_index, torch.zeros_like(targets), targets)
+        onehot = F.one_hot(targets_safe, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        probs = probs * valid_mask
+        onehot = onehot * valid_mask
+        inter = torch.sum(probs * onehot, dim=(2, 3))
+        card = torch.sum(probs + onehot, dim=(2, 3))
+        dice = 1.0 - ((2.0 * inter + 1e-5) / (card + 1e-5)).mean()
+        return (self.ce_weight * ce + self.dice_weight * dice)
+
+def build_diffusion_schedule(total_steps: int, device: torch.device):
+    betas = torch.linspace(1e-4, 2e-2, total_steps, device=device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    return {
+        "T": total_steps,
+        "sqrt_alphas_cumprod": torch.sqrt(alphas_cumprod),
+        "sqrt_one_minus_alphas_cumprod": torch.sqrt(1.0 - alphas_cumprod),
+    }
+
+
+def sample_timesteps(batch_size: int, total_steps: int, device: torch.device):
+    r = torch.rand((batch_size,), device=device)
+    t = (1 - r ** 3) * (total_steps - 1)
+    return t.long()
+
+
+def add_mask_noise(gt_mask: torch.Tensor, t: torch.Tensor, schedule: Dict[str, torch.Tensor]):
+    noise = torch.randn_like(gt_mask)
+    s_alpha = schedule["sqrt_alphas_cumprod"][t.long()].view(gt_mask.shape[0], 1, 1, 1)
+    s_noise = schedule["sqrt_one_minus_alphas_cumprod"][t.long()].view(gt_mask.shape[0], 1, 1, 1)
+    noisy_mask = s_alpha * gt_mask + s_noise * noise
+    return noisy_mask, noise
+
+
+# ====================== 改进的数据集类 ======================
+class MAFSegDataset(Dataset):
+    def __init__(self, root, split="train", image_size=336, num_classes=7, label_mapping=None):
+        self.root = Path(root)
+        self.split = split
+        self.image_size = image_size
+        self.num_classes = num_classes
+        self.img_dir = self.root / split / "image"
+        self.mask_dir = self.root / split / "mask"
+        self.images = sorted(list(self.img_dir.glob("*.png")) + list(self.img_dir.glob("*.jpg")))
+        self.default_mapping = label_mapping or {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}
+
+       
+        if split == "train":
+            self.transform = A.Compose([
+    # 1. scale 必须在 0 到 1 之间 (例如 0.5 到 1.0)
+    # 2. 使用 size 参数或者确保符合新版 API
+    A.RandomResizedCrop(
+        size=(image_size, image_size), 
+        scale=(0.5, 1.0), 
+        p=1.0
+    ),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.2, rotate_limit=15, p=0.5),
+                A.OneOf([
+                    A.GridDistortion(p=0.3),
+                    A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=0.3),
+                ], p=0.2),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.3),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+        else:
+            self.transform = A.Compose([
+                A.Resize(image_size, image_size),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+
+    def _load_mask(self, p: Path) -> np.ndarray:
+        m = np.array(Image.open(p).convert("L"))
+        # 简单映射逻辑
+        out = np.full_like(m, 255)
+        for k, v in self.default_mapping.items():
+            out[m == k] = v
+        return out
+
+    def __len__(self): return len(self.images)
+
+    def __getitem__(self, idx):
+        img_p = self.images[idx]
+        mask_p = self.mask_dir / f"{img_p.stem}.png"
+        img = np.array(Image.open(img_p).convert("RGB"))
+        mask = self._load_mask(mask_p)
+        
+        augmented = self.transform(image=img, mask=mask)
+        return augmented["image"], augmented["mask"].long()
+
+# ====================== 改进的评价函数 (支持迭代细化) ======================
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int) -> Dict[str, float]:
+    model.eval()
+    conf = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    for imgs, masks in loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        output = model(imgs) 
+        logits = output[0] if isinstance(output, tuple) else output
+        
+        pred = logits.argmax(dim=1)
+        valid = masks != 255
+        idx = masks[valid] * num_classes + pred[valid]
+        conf += torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+    # 计算 IoU
+    iou = conf.diag() / (conf.sum(1) + conf.sum(0) - conf.diag() + 1e-6)
+    miou = float(iou.mean().item())
+    
+    # --- 新增 FWIoU 计算 ---
+    freq = conf.sum(1) / (conf.sum() + 1e-6)
+    fwiou = float((freq * iou).sum().item())
+    
+    # Pixel Accuracy
+    pixel_acc = float((conf.diag().sum() / (conf.sum() + 1e-6)).item())
+    
+    return {"mIoU": miou, "FWIoU": fwiou, "pixel_acc": pixel_acc}
+
+
+def plot_curves(epochs, losses, mious, fwious, accs, save_path):
+    fig, axes = plt.subplots(4, 1, figsize=(10, 15))
+    axes[0].plot(epochs, losses, 'r-'); axes[0].set_title("Train Loss")
+    axes[1].plot(epochs, mious, 'g-'); axes[1].set_title("Val mIoU")
+    axes[2].plot(epochs, fwious, 'm-'); axes[2].set_title("Val FWIoU")
+    axes[3].plot(epochs, accs, 'b-'); axes[3].set_title("Val Pixel Acc")
+    for ax in axes: ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path); plt.close()
+
+
+def _extract_vae_state(model: nn.Module) -> Dict[str, torch.Tensor]:
+    state = model.state_dict()
+    prefixes = ("mask_embed.", "mask_encoder.", "mask_decoder.", "image_encoder.")
+    return {k: v for k, v in state.items() if k.startswith(prefixes)}
+
+
+@torch.no_grad()
+def evaluate_reconstruction(model: nn.Module, loader: DataLoader, device: torch.device,
+                            num_classes: int, loss_fn: nn.Module) -> Dict[str, float]:
+    model.eval()
+    conf = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    total_loss = 0.0
+    batches = 0
+    for imgs, masks in loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        target_for_onehot = masks.clone()
+        target_for_onehot[target_for_onehot == 255] = 0
+        gt_mask = F.one_hot(target_for_onehot, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
+        recon_logits = model.decode_mask_latent(gt_latent)
+        loss = loss_fn(recon_logits, masks)
+        total_loss += loss.item()
+        batches += 1
+        pred = recon_logits.argmax(dim=1)
+        valid = masks != 255
+        idx = masks[valid] * num_classes + pred[valid]
+        conf += torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+    iou = conf.diag() / (conf.sum(1) + conf.sum(0) - conf.diag() + 1e-6)
+    miou = float(iou.mean().item())
+    freq = conf.sum(1) / (conf.sum() + 1e-6)
+    fwiou = float((freq * iou).sum().item())
+    pixel_acc = float((conf.diag().sum() / (conf.sum() + 1e-6)).item())
+    avg_loss = total_loss / max(batches, 1)
+    return {"loss": avg_loss, "mIoU": miou, "FWIoU": fwiou, "pixel_acc": pixel_acc}
+
+
+def evaluate_stage0(model: nn.Module, loader: DataLoader, device: torch.device,
+                    num_classes: int, loss_fn: nn.Module) -> Dict[str, float]:
+    return evaluate_reconstruction(model, loader, device, num_classes, loss_fn)
+
+
+def evaluate_stage1(model: nn.Module, loader: DataLoader, device: torch.device,
+                    num_classes: int) -> Dict[str, float]:
+    return evaluate(model, loader, device, num_classes)
+
+
+@torch.no_grad()
+def evaluate_stage2(model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int,
+                    t_start: int = 200, num_steps: int = 5, T: int = 1000,
+                    betas: torch.Tensor | None = None) -> Dict[str, float]:
+    model.eval()
+    conf_coarse = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    conf_refined = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+    if betas is None:
+        betas = torch.linspace(1e-4, 2e-2, T, device=device)
+    else:
+        betas = betas.to(device)
+
+    def _metrics(conf: torch.Tensor) -> Dict[str, float]:
+        iou = conf.diag() / (conf.sum(1) + conf.sum(0) - conf.diag() + 1e-6)
+        miou = float(iou.mean().item())
+        freq = conf.sum(1) / (conf.sum() + 1e-6)
+        fwiou = float((freq * iou).sum().item())
+        pixel_acc = float((conf.diag().sum() / (conf.sum() + 1e-6)).item())
+        return {"mIoU": miou, "FWIoU": fwiou, "pixel_acc": pixel_acc}
+    def compute_direct_miou(recon_logits, masks, num_classes=7):
+    
+    # 1. 转换预测值为类别索引
+        pred = recon_logits.argmax(dim=1)
+    
+    # 2. 掩码过滤
+        valid = (masks != 255)
+        target = masks[valid]
+        predict = pred[valid]
+    
+    # 3. 计算混淆矩阵
+        indices = target * num_classes + predict
+        conf = torch.bincount(indices, minlength=num_classes**2).reshape(num_classes, num_classes)
+    
+    # 4. 计算 IoU
+        intersection = conf.diag()
+        union = conf.sum(1) + conf.sum(0) - intersection + 1e-6
+        iou = intersection / union
+        return iou.mean().item()
+    
+    for imgs, masks in loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        output = model(imgs)
+        coarse_logits = output[0] if isinstance(output, tuple) else output
+        pred_coarse = coarse_logits.argmax(dim=1)
+        with torch.no_grad():
+    # --- 准备 GT Mask (Stage 0 的输入格式) ---
+           target_for_onehot = masks.clone()
+           target_for_onehot[target_for_onehot == 255] = 0
+           gt_onehot = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+    
+    # --- 测试 1: 纯 GT 直通 (验证权重是否真实有效) ---
+           gt_latent = model.encode_mask_latent(gt_onehot, is_logits=False)
+           gt_recon = model.decode_mask_latent(gt_latent)
+           gt_miou = compute_direct_miou(gt_recon, masks) # 使用之前给你的计算函数
+    
+    # --- 测试 2: Coarse Logits 直通 (验证接口转换是否有效) ---
+    # 先不加任何温度缩放试试
+           c_latent = model.encode_mask_latent(coarse_logits, is_logits=True)
+           c_recon = model.decode_mask_latent(c_latent)
+           c_miou = compute_direct_miou(c_recon, masks)
+
+    
+        print(f"\n" + "-"*30)
+        print(f"[DEBUG] 测试 1 (GT 重构 mIoU): {gt_miou:.4f}")
+        print(f"[DEBUG] 测试 2 (Coarse 重构 mIoU): {c_miou:.4f}")
+        print(f"[DEBUG] Latent 数值范围: min={gt_latent.min():.2f}, max={gt_latent.max():.2f}")
+        print("-"*30)
+
+        refined_logits = model.refine_sample(imgs, t_start=t_start, num_steps=num_steps, T=T, betas=betas)
+        pred_refined = refined_logits.argmax(dim=1)
+
+        valid = masks != 255
+        idx_c = masks[valid] * num_classes + pred_coarse[valid]
+        conf_coarse += torch.bincount(idx_c, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+        idx_r = masks[valid] * num_classes + pred_refined[valid]
+        conf_refined += torch.bincount(idx_r, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+    refined = _metrics(conf_refined)
+    coarse = _metrics(conf_coarse)
+    refined.update({
+        "coarse_mIoU": coarse["mIoU"],
+        "coarse_FWIoU": coarse["FWIoU"],
+        "coarse_pixel_acc": coarse["pixel_acc"],
+    })
+    return refined
+# ====================== 主训练函数 ======================
+def main():
+    parser = argparse.ArgumentParser()
+    # stage0: pretrain latent mask modules with reconstruction loss
+    # stage1: train backbone coarse segmentation with CE + Dice + Focal
+    # stage2: freeze backbone and train conditional diffusion refinement with noise MSE
+    parser.add_argument("--data_root", type=str, default="/workspace/MAF")
+    parser.add_argument("--sam3_ckpt", type=str, default="/workspace/sam3/sam3.pt")
+    parser.add_argument("--init_weights", type=str, default="/workspace/weights/SAM3UNetDiffusionv3_st1/best.pt", help="Optional checkpoint to resume stage training")
+    parser.add_argument("--save_dir", type=str, default="/workspace/weights/SAM3UNetDiffusionv3_st2")
+    parser.add_argument("--image_size", type=int, default=336)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--train_stage", type=str, default="stage2", choices=["stage0", "stage1", "stage2"])
+    parser.add_argument("--vae_checkpoint", type=str, default="/workspace/weights/SAM3UNetDiffusionv3_st0/vae_pretrain.pt", help="Optional latent pretrain checkpoint")
+    parser.add_argument("--stage0_train_image_encoder", action="store_true",
+                        help="Also train image_encoder to align with mask latent during stage0")
+    parser.add_argument("--stage0_image_latent_weight", type=float, default=0.1)
+    parser.add_argument("--stage2_freeze_latent_epochs", type=int, default=0)
+    parser.add_argument("--stage2_latent_lr_scale", type=float, default=0.5)
+    parser.add_argument("--stage2_recon_weight", type=float, default=0.1)
+    parser.add_argument("--diffusion_steps", type=int, default=1000)
+    parser.add_argument("--maf_config", type=str, default="/workspace/MAF_Seg/config/maf_fujian.py")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    save_dir = Path(args.save_dir); save_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = load_maf_fujian_meta(args.maf_config)
+    gt_map = meta.get("GT_LABEL_MAPPING", None)
+
+    train_loader = DataLoader(MAFSegDataset(args.data_root, "train", args.image_size, label_mapping=gt_map), 
+                              batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(MAFSegDataset(args.data_root, "test", args.image_size, label_mapping=gt_map), 
+                            batch_size=2, shuffle=False, num_workers=4)
+
+    model = SAM3UNetCNNDifussionv3(checkpoint_path=args.sam3_ckpt, img_size=args.image_size, num_classes=7,
+                                 vae_checkpoint=args.vae_checkpoint or None).to(device)
+    if args.train_stage == "stage2" and not args.init_weights:
+        raise ValueError("Stage2 requires --init_weights from the best stage1 checkpoint.")
+    if args.init_weights:
+        ckpt = torch.load(args.init_weights, map_location=device)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        model.load_state_dict(ckpt, strict=False)
+        print(f"Loaded initial weights from {args.init_weights}")
+
+    model.configure_training_stage(args.train_stage, train_image_encoder=args.stage0_train_image_encoder)
+    print(f"Training stage: {args.train_stage}")
+
+    # 分层学习率分配
+    params = []
+    stage2_prefixes = ("diffusion_head.", "mask_embed.", "image_encoder.", "mask_encoder.", "mask_decoder.")
+    for n, p in model.named_parameters():
+        if args.train_stage == "stage2":
+            if not n.startswith(stage2_prefixes):
+                continue
+        elif not p.requires_grad:
+            continue
+        lr = args.lr
+        if args.train_stage == "stage1":
+            if "sam3_vit" in n: lr *= 0.1
+            elif "eba" in n: lr *= 2.0
+        elif args.train_stage == "stage2":
+            if n.startswith(("mask_embed.", "image_encoder.", "mask_encoder.", "mask_decoder.")):
+                lr *= args.stage2_latent_lr_scale
+            elif "diffusion_head" in n:
+                lr *= 1.5
+        params.append({"params": [p], "lr": lr})
+
+    optimizer = torch.optim.AdamW(params, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    stage1_criterion = Stage1SegLoss(num_classes=7, ignore_index=255).to(device)
+    latent_criterion = LatentReconstructionLoss(num_classes=7, ignore_index=255).to(device)
+    stage2_criterion = DiffusionLoss(focal_weight=0.0, dice_weight=0.0,
+                                     boundary_weight=0.0, diffusion_weight=1.0,
+                                     repa_weight=0.5).to(device)
+    diffusion_schedule = build_diffusion_schedule(args.diffusion_steps, device) if args.train_stage == "stage2" else None
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    best_miou = -1.0
+    history = {"epoch": [], "loss": [], "miou": [], "fwiou":[], "acc":[]}
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        if args.train_stage == "stage2" and args.stage2_freeze_latent_epochs > 0:
+            freeze_latent = epoch <= args.stage2_freeze_latent_epochs
+            for module in [model.mask_embed, model.mask_encoder, model.mask_decoder, model.image_encoder]:
+                model._set_module_requires_grad(module, not freeze_latent)
+        running_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+
+        for imgs, masks in pbar:
+            imgs, masks = imgs.to(device), masks.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                if args.train_stage == "stage0":
+                    target_for_onehot = masks.clone()
+                    target_for_onehot[target_for_onehot == 255] = 0
+                    gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+                    gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
+                    recon_logits = model.decode_mask_latent(gt_latent)
+                    loss = latent_criterion(recon_logits, masks)
+                    if args.stage0_train_image_encoder:
+                        image_latent = model.encode_image_latent(imgs)
+                        image_latent = F.interpolate(image_latent, size=gt_latent.shape[2:], mode="bilinear", align_corners=False)
+                        loss = loss + args.stage0_image_latent_weight * F.mse_loss(image_latent, gt_latent.detach())
+                elif args.train_stage == "stage1":
+                    coarse_logits, boundary_logits = model(imgs)
+                    boundary_gt = compute_boundary_gt(masks, ignore_index=255).to(device)
+                    loss = stage1_criterion(coarse_logits, masks, boundary_logits, boundary_gt)
+                else:
+                    B = imgs.shape[0]
+                    with torch.no_grad():
+                        teacher_feat, _, _ = model._extract_features(imgs)
+                    target_for_onehot = masks.clone()
+                    target_for_onehot[target_for_onehot == 255] = 0
+                    gt_mask = F.one_hot(target_for_onehot, num_classes=7).permute(0, 3, 1, 2).float()
+                    t = sample_timesteps(B, diffusion_schedule["T"], device)
+                    t_float = t.float()
+                    # Latent diffusion: encode GT mask into latent space before noising.
+                    gt_latent = model.encode_mask_latent(gt_mask, is_logits=False)
+                    noisy_latent, true_noise = add_mask_noise(gt_latent, t_float, diffusion_schedule)
+                    coarse_logits, boundary_logits, noise_pred, repa_feat = model(imgs, noisy_latent, t_float)
+                    loss = stage2_criterion(coarse_logits, masks,
+                                            boundary_logits=boundary_logits,
+                                            noise_pred=noise_pred,
+                                            true_noise=true_noise,
+                                            repa_feat=repa_feat,
+                                            teacher_feat=teacher_feat)
+                    # if args.stage2_recon_weight > 0:
+                    #     s_alpha = diffusion_schedule["sqrt_alphas_cumprod"][t.long()].view(B, 1, 1, 1)
+                    #     s_noise = diffusion_schedule["sqrt_one_minus_alphas_cumprod"][t.long()].view(B, 1, 1, 1)
+                    #     noise_pred_resized = noise_pred
+                    #     if noise_pred_resized.shape != noisy_latent.shape:
+                    #         noise_pred_resized = F.interpolate(noise_pred_resized, size=noisy_latent.shape[2:], mode="bilinear", align_corners=False)
+                        # pred_latent = (noisy_latent - s_noise * noise_pred_resized) / (s_alpha + 1e-8)
+                        # recon_logits = model.decode_mask_latent(pred_latent)
+                        # loss = loss + args.stage2_recon_weight * latent_criterion(recon_logits, masks)
+
+            # 反向传播
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            pbar.set_postfix(loss=f"{running_loss/(pbar.n+1):.4f}")
+
+        # 评估与记录
+        avg_loss = running_loss / len(train_loader)
+        if args.train_stage == "stage0":
+            metrics = evaluate_stage0(model, val_loader, device, 7, latent_criterion)
+            val_loss = metrics["loss"]
+        elif args.train_stage == "stage1":
+            metrics = evaluate_stage1(model, val_loader, device, 7)
+        else:
+            t_start = min(200, args.diffusion_steps - 1)
+            metrics = evaluate_stage2(model, val_loader, device, 7, t_start=t_start,
+                                      num_steps=5, T=args.diffusion_steps)
+        scheduler.step()
+
+        history["epoch"].append(epoch)
+        history["loss"].append(avg_loss)
+        history["miou"].append(metrics["mIoU"])
+        history["fwiou"].append(metrics["FWIoU"])
+        history["acc"].append(metrics["pixel_acc"])
+
+
+        if metrics["mIoU"] > best_miou:
+            best_miou = metrics["mIoU"]
+            torch.save(model.state_dict(), save_dir / "best.pt")
+            if args.train_stage == "stage0":
+                torch.save(_extract_vae_state(model), save_dir / "vae_pretrain.pt")
+            print(f"新最佳模型已保存: mIoU = {best_miou:.4f}, FWIoU = {metrics['FWIoU']:.4f}")
+
+        plot_curves(history["epoch"], history["loss"], history["miou"], history["fwiou"], history["acc"], save_dir / "curves.png")
+        if args.train_stage == "stage0":
+            print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | ValLoss: {val_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
+        elif args.train_stage == "stage1":
+            print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | mIoU: {metrics['mIoU']:.4f} | FWIoU: {metrics['FWIoU']:.4f}")
+        else:
+            print(
+                f"Epoch {epoch} | Loss: {avg_loss:.4f} | Refined mIoU: {metrics['mIoU']:.4f} | "
+                f"Refined FWIoU: {metrics['FWIoU']:.4f} | Coarse mIoU: {metrics['coarse_mIoU']:.4f} | "
+                f"Coarse FWIoU: {metrics['coarse_FWIoU']:.4f}"
+            )
+
+    # 训练结束后保存一次
+        torch.save(model.state_dict(), save_dir / "final_model.pt")
+        print(f"训练完成，模型已保存至 {save_dir / 'final_model.pt'}")
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    main()
